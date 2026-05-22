@@ -22,6 +22,19 @@ import tensorrt as trt
 
 warnings.filterwarnings("ignore")
 
+
+def find_repo_root(start_path: str) -> str:
+    current = os.path.abspath(start_path)
+    while True:
+        if os.path.exists(os.path.join(current, 'package.xml')):
+            return current
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    return os.path.abspath(os.path.join(start_path, '..', '..'))
+
+
 # ==========================================
 # GPU SELECTION & TENSORRT CONFIG
 # ==========================================
@@ -47,7 +60,8 @@ else:
 TRT_LOGGER = trt.Logger(trt.Logger.ERROR)
 trt.init_libnvinfer_plugins(TRT_LOGGER, "")
 
-ENGINE_CACHE_DIR = "./trt_engine_cache"
+REPO_ROOT = find_repo_root(os.path.dirname(os.path.realpath(__file__)))
+ENGINE_CACHE_DIR = os.path.join(REPO_ROOT, "trt_engine_cache")
 
 # ==========================================
 # CONSTANTS & UTILS
@@ -202,9 +216,9 @@ class TrtEvaluationNode(Node):
         self.get_logger().info("All 8 engines loaded successfully.")
 
         # Setup Inference Output Publishers
-        self.publishers = {}
+        self.inference_publishers = {}
         for cam in ['front_left', 'rear', 'side_left', 'side_right']:
-            self.publishers[cam] = {
+            self.inference_publishers[cam] = {
                 'depth': self.create_publisher(Image, f'/inference/{cam}/depth', 10),
                 'seg': self.create_publisher(Image, f'/inference/{cam}/seg', 10),
             }
@@ -237,8 +251,8 @@ class TrtEvaluationNode(Node):
             depth_msg.header = header
             seg_msg = self.bridge.cv2_to_imgmsg(seg_arr.astype(np.uint8), encoding='8UC1')
             seg_msg.header = header
-            self.publishers[cam_name]['depth'].publish(depth_msg)
-            self.publishers[cam_name]['seg'].publish(seg_msg)
+            self.inference_publishers[cam_name]['depth'].publish(depth_msg)
+            self.inference_publishers[cam_name]['seg'].publish(seg_msg)
         except Exception as e:
             self.get_logger().error(f"Failed to publish inference outputs for {cam_name}: {e}", exc_info=True)
 

@@ -8,13 +8,26 @@ import tensorrt as trt
 TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
 trt.init_libnvinfer_plugins(TRT_LOGGER, "")
 
+
+def find_repo_root(start_path: str) -> str:
+    current = os.path.abspath(start_path)
+    while True:
+        if os.path.exists(os.path.join(current, 'package.xml')):
+            return current
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    return os.path.abspath(os.path.join(start_path, '..', '..'))
+
+
 class EngineBuilderNode(Node):
     def __init__(self):
         super().__init__('engine_builder_node')
         
-        # Consistent directory paths for your T4 environment
-        self.onnx_dir = "./"  # Where your .onnx files sit
-        self.engine_dir = "./trt_engine_cache"
+        repo_root = find_repo_root(os.path.dirname(os.path.realpath(__file__)))
+        self.onnx_dir = os.path.join(repo_root, "ONNX_Models")  # Where your .onnx files sit
+        self.engine_dir = os.path.join(repo_root, "trt_engine_cache")
         os.makedirs(self.engine_dir, exist_ok=True)
 
         # List of files to process sequentially

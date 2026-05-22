@@ -16,3 +16,44 @@ trt_engine_cache/
 metrics.json
 *.avi
 *.mp4
+
+# Local and editor files
+.vscode/
+*.swp
+*.swo
+*.tmp
+*.bak
+*.log
+*.out
+
+# Python environments
+venv/
+.venv/
+env/
+ENV/
+
+# Model and data artifacts
+ONNX_Models/
+*.onnx
+*.onnxmodel
+*.engine
+trt_engine_cache/
+*.pt
+*.pth
+*.pb
+*.tflite
+*.h5
+*.ckpt
+*.ckpt.*
+
+# Python package metadata
+*.egg-info/
+
+# Generated documentation / TeX build files
+*.aux
+*.toc
+*.log
+*.out
+*.synctex.gz
+*.pdf
+*.tex~

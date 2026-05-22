@@ -290,6 +290,10 @@ class DashboardNode(Node):
             cv2.putText(bev, "PRED: 80m Grid BEV", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 3)
             cv2.putText(chase, "PRED: Chase View", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 3)
             cv2.putText(occ, "PRED: OCCUPANCY (80m)", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+
+            # The BEV and chase renderers create RGB images; convert to BGR for OpenCV bridge.
+            bev = cv2.cvtColor(bev, cv2.COLOR_RGB2BGR)
+            chase = cv2.cvtColor(chase, cv2.COLOR_RGB2BGR)
             
             header = msgs[0].header
             self.pub_pred_bev.publish(self.bridge.cv2_to_imgmsg(bev, encoding="bgr8", header=header))
@@ -312,6 +316,9 @@ class DashboardNode(Node):
             cv2.putText(bev, "GT: 80m Grid BEV", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 3)
             cv2.putText(chase, "GT: Chase View", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 3)
             cv2.putText(occ, "GT: OCCUPANCY (80m)", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+
+            bev = cv2.cvtColor(bev, cv2.COLOR_RGB2BGR)
+            chase = cv2.cvtColor(chase, cv2.COLOR_RGB2BGR)
 
             header = msgs[0].header
             self.pub_gt_bev.publish(self.bridge.cv2_to_imgmsg(bev, encoding="bgr8", header=header))

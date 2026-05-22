@@ -35,6 +35,8 @@ class CarlaNode(Node):
         self.bridge = CvBridge()
         self.sensor_queue = queue.Queue()
         self.actor_list = []
+        self.tick_counter = 0
+        self.sensor_callback_count = 0
         
         # ROS2 Publishers for each camera
         self.publishers_dict = {}
@@ -51,8 +53,8 @@ class CarlaNode(Node):
         # Connect to CARLA
         self.connect_to_carla()
         
-        # Timer to tick CARLA and publish frames at 50Hz (0.02 seconds)
-        self.timer = self.create_timer(0.02, self.tick_and_publish)
+        # Timer to tick CARLA and publish frames at 10Hz (0.1 seconds)
+        self.timer = self.create_timer(0.1, self.tick_and_publish)
 
     def connect_to_carla(self):
         self.get_logger().info("Connecting to CARLA on 127.0.0.1:2000...")
@@ -72,6 +74,45 @@ class CarlaNode(Node):
         self.tm.set_synchronous_mode(True)
 
         self.spawn_ego_and_sensors()
+        self.setup_spectator_camera()
+
+    def setup_spectator_camera(self):
+        """Set spectator camera to chase view matching dashboard_node VC config"""
+        # Chase camera config from dashboard_node.py VC
+        self.spectator_offset = carla.Vector3D(x=-15.0, y=0.0, z=8.0)
+        self.spectator_rotation = carla.Rotation(pitch=-20, yaw=0, roll=0)
+        self.get_logger().info("Spectator camera initialized (chase view mode)")
+
+    def make_sensor_callback(self, name, sensor_type):
+        def callback(data):
+            self._sensor_callback(name, sensor_type, data)
+        return callback
+
+    def _sensor_callback(self, name, sensor_type, data):
+        self.sensor_callback_count += 1
+        if self.sensor_callback_count == 1 or self.sensor_callback_count % 50 == 0:
+            self.get_logger().info(f"CARLA sensor callback #{self.sensor_callback_count}: {name}/{sensor_type}")
+        self.sensor_queue.put((name, sensor_type, data))
+
+    def update_spectator_camera(self):
+        """Update spectator camera position relative to ego vehicle"""
+        if self.ego_vehicle is None or not self.ego_vehicle.is_alive:
+            return
+        ego_transform = self.ego_vehicle.get_transform()
+        forward = ego_transform.get_forward_vector()
+        right = ego_transform.get_right_vector()
+        up = ego_transform.get_up_vector()
+
+        offset = self.spectator_offset
+        spectator_loc = carla.Location(
+            x=ego_transform.location.x + forward.x * offset.x + right.x * offset.y + up.x * offset.z,
+            y=ego_transform.location.y + forward.y * offset.x + right.y * offset.y + up.y * offset.z,
+            z=ego_transform.location.z + forward.z * offset.x + right.z * offset.y + up.z * offset.z,
+        )
+
+        ego_yaw = ego_transform.rotation.yaw
+        spectator_rot = carla.Rotation(pitch=self.spectator_rotation.pitch, yaw=ego_yaw, roll=self.spectator_rotation.roll)
+        self.world.get_spectator().set_transform(carla.Transform(spectator_loc, spectator_rot))
 
     def spawn_ego_and_sensors(self):
         bp_lib = self.world.get_blueprint_library()
@@ -95,6 +136,8 @@ class CarlaNode(Node):
         self.get_logger().info("Ego vehicle spawned and autopilot engaged.")
 
         sensor_types = ['image', 'depth', 'seg'] if self.debug else ['image']
+        self.expected_sensor_frames = len(CAMS) * len(sensor_types)
+        self.get_logger().info(f"Expecting {self.expected_sensor_frames} CARLA camera streams.")
 
         # Spawn Cameras
         for name, ext in CAMS.items():
@@ -107,24 +150,26 @@ class CarlaNode(Node):
                 blueprint.set_attribute('image_size_x', str(ext['w']))
                 blueprint.set_attribute('image_size_y', str(ext['h']))
                 blueprint.set_attribute('fov', str(ext['fov']))
-                blueprint.set_attribute('sensor_tick', '0.033')
+                blueprint.set_attribute('sensor_tick', '0.0')
 
                 cam = self.world.spawn_actor(blueprint, tf, attach_to=self.ego_vehicle)
-                cam.listen(lambda data, n=name, st=sensor_type: self.sensor_queue.put((n, st, data)))
+                cam.listen(self.make_sensor_callback(name, sensor_type))
                 self.actor_list.append(cam)
                 self.get_logger().info(f"Spawned {sensor_type} camera for {name}.")
 
     def tick_and_publish(self):
         try:
             self.world.tick()
+            self.update_spectator_camera()
         except Exception as e:
             self.get_logger().error(f"CARLA tick failed: {e}", exc_info=True)
             return
         
-        expected = len(CAMS) * (3 if self.debug else 1)
+        self.tick_counter += 1
+        expected = getattr(self, 'expected_sensor_frames', len(CAMS) * (3 if self.debug else 1))
         gathered = 0
         timeout_start = time.time()
-        
+
         while gathered < expected and (time.time() - timeout_start) < 2.0:
             try:
                 cam_name, sensor_type, data = self.sensor_queue.get(timeout=0.1)
@@ -145,6 +190,17 @@ class CarlaNode(Node):
             except Exception as e:
                 self.get_logger().error(f"Failed to publish CARLA sensor frame: {e}", exc_info=True)
                 continue
+
+        if gathered == 0:
+            self.get_logger().warn(
+                f"CARLA tick produced no sensor frames after {time.time() - timeout_start:.2f}s; queue size={self.sensor_queue.qsize()}"
+            )
+        elif self.debug and gathered < expected:
+            self.get_logger().warn(
+                f"CARLA tick produced partial data {gathered}/{expected}; queue size={self.sensor_queue.qsize()}"
+            )
+        elif self.debug and self.tick_counter % 50 == 0:
+            self.get_logger().info(f"CARLA tick published {gathered}/{expected} frames; queue size={self.sensor_queue.qsize()}")
 
     def destroy_node(self):
         self.get_logger().info("Shutting down CARLA node and cleaning up actors...")

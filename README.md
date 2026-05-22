@@ -312,9 +312,9 @@ ros2 run perception_pipeline engine_builder_node
 ```
 
 **Process:**
-1. Searches for `.onnx` files in `./`
+1. Searches for `.onnx` files in `perception-pipeline/ONNX_Models`
 2. Compiles to FP16 TensorRT engines
-3. Saves to `./trt_engine_cache/`
+3. Saves to `perception-pipeline/trt_engine_cache/`
 4. Skips if engine already exists
 
 **Models Expected:**
@@ -464,11 +464,11 @@ source install/setup.bash
 
 ### Pre-compile Engines (One-time)
 ```bash
-# Place .onnx files in current directory
+# Place .onnx files in perception-pipeline/ONNX_Models
 cd ~/ros2_ws/src/perception_pipeline
 ros2 run perception_pipeline engine_builder_node
 # Wait 10-20 minutes...
-# Engines saved to ./trt_engine_cache/
+# Engines saved to perception-pipeline/trt_engine_cache/
 ```
 
 ---
@@ -483,7 +483,7 @@ ros2 run perception_pipeline engine_builder_node
 
 2. **Engines compiled:**
    ```bash
-   ls ./trt_engine_cache/
+   ls perception-pipeline/trt_engine_cache/
    # Should show: stereonet.engine, seg_front.engine, ...
    ```
 
@@ -930,7 +930,7 @@ ts.registerCallback(lambda *msgs, name=cam_name: self.eval_callback(name, *msgs)
 Before deploying to production:
 
 - [ ] CARLA server running and accessible
-- [ ] All TensorRT engines compiled and present in `./trt_engine_cache/`
+- [ ] All TensorRT engines compiled and present in `perception-pipeline/trt_engine_cache/`
 - [ ] GPU drivers and CUDA properly installed
 - [ ] Build succeeds: `colcon build --packages-select perception_pipeline`
 - [ ] Test production mode: `debug:=false` for 60 seconds
@@ -970,7 +970,7 @@ Solution: Start CARLA server: ./CarlaUE4.sh -windowed
 
 ### TensorRT Engines Not Found
 ```
-Error: FileNotFoundError: ./trt_engine_cache/stereonet.engine
+Error: FileNotFoundError: perception-pipeline/trt_engine_cache/stereonet.engine
 Solution: Pre-compile engines: ros2 run perception_pipeline engine_builder_node
 ```
 
