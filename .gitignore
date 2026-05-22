@@ -1,0 +1,18 @@
+# ROS 2 build folders
+build/
+install/
+log/
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Deep Learning / TensorRT models
+*.onnx
+*.engine
+trt_engine_cache/
+
+# Outputs / Logs
+metrics.json
+*.avi
+*.mp4
