@@ -32,6 +32,8 @@ setup(
             'engine_builder_node = perception_pipeline.engine_builder_node:main',
             'evaluate_node = perception_pipeline.evaluate_node:main',
             'infrence_node = perception_pipeline.infrence_node:main',
+            'ekf_node = perception_pipeline.ekf_node:main',
+            'visual_odometry_node = perception_pipeline.visual_odometry_node:main',
         ],
     },
 )

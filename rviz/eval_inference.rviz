@@ -1,0 +1,65 @@
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Name: Grid
+      Class: rviz_default_plugins/Grid
+      Enabled: true
+      Cell Size: 1
+      Plane Cell Count: 50
+
+    # ==========================================
+    # INFERENCE MODE (Always On)
+    # ==========================================
+    - Name: Inference (Always On)
+      Class: rviz_default_plugins/Group
+      Enabled: true
+      Displays:
+        - Name: EKF Odometry (Blue)
+          Class: rviz_default_plugins/Odometry
+          Enabled: true
+          Topic: /ekf/odometry
+          Color: 0; 112; 255
+          Keep: 200
+          Shape: Arrow
+        - Name: Pred BEV
+          Class: rviz_default_plugins/Image
+          Enabled: true
+          Topic: /dashboard/pred/bev
+        - Name: Pred Chase
+          Class: rviz_default_plugins/Image
+          Enabled: true
+          Topic: /dashboard/pred/chase
+        - Name: Pred Occupancy
+          Class: rviz_default_plugins/Image
+          Enabled: true
+          Topic: /dashboard/pred/occupancy
+
+    # ==========================================
+    # DEBUG MODE (Toggle via UI or Launch)
+    # ==========================================
+    - Name: Debug / Ground Truth
+      Class: rviz_default_plugins/Group
+      Enabled: false
+      Displays:
+        - Name: GT Odometry (Green)
+          Class: rviz_default_plugins/Odometry
+          Enabled: true
+          Topic: /carla/ego_vehicle/odometry
+          Color: 20; 220; 20
+          Keep: 200
+          Shape: Arrow
+        - Name: GT BEV
+          Class: rviz_default_plugins/Image
+          Enabled: true
+          Topic: /dashboard/gt/bev
+        - Name: GT Chase
+          Class: rviz_default_plugins/Image
+          Enabled: true
+          Topic: /dashboard/gt/chase
+        - Name: GT Occupancy
+          Class: rviz_default_plugins/Image
+          Enabled: true
+          Topic: /dashboard/gt/occupancy
+
+  Global Options:
+    Fixed Frame: odom

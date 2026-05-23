@@ -1,13 +1,18 @@
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from std_msgs.msg import Header
+from sensor_msgs.msg import Image, Imu, NavSatFix, PointCloud2, PointField
+from nav_msgs.msg import Odometry
+import sensor_msgs_py.point_cloud2 as pc2
 from cv_bridge import CvBridge
+
 import carla
 import numpy as np
 import time
 import queue
+import math
 
-# Physical Camera Configurations from your original script
+# Physical Camera Configurations
 CAMS = {
     "front_left": {"fov": 90, "w": 1280, "h": 720, "x": 1.4, "y": -0.25, "z": 1.5, "pitch": -12.0, "yaw": 0.0, "roll": 0.0},
     "front_right": {"fov": 90, "w": 1280, "h": 720, "x": 1.4, "y": 0.25, "z": 1.5, "pitch": -12.0, "yaw": 0.0, "roll": 0.0},
@@ -40,24 +45,36 @@ class CarlaNode(Node):
         self.tick_counter = 0
         self.sensor_callback_count = 0
         
-        # ROS2 Publishers for each camera
+        # ROS2 Publishers for Cameras
         self.publishers_dict = {}
         for cam_name in CAMS.keys():
             self.publishers_dict[cam_name] = {}
             self.publishers_dict[cam_name]['image'] = self.create_publisher(Image, f'/carla/{cam_name}/image', 10)
-            self.get_logger().info(f"Created Publisher: /carla/{cam_name}/image")
             if self.debug:
                 self.publishers_dict[cam_name]['depth'] = self.create_publisher(Image, f'/carla/{cam_name}/depth', 10)
                 self.publishers_dict[cam_name]['seg'] = self.create_publisher(Image, f'/carla/{cam_name}/seg', 10)
-                self.get_logger().info(f"Created Publisher: /carla/{cam_name}/depth")
-                self.get_logger().info(f"Created Publisher: /carla/{cam_name}/seg")
+
+        # ROS2 Publishers for V6 Suite
+        self.imu_pubs = {
+            'primary': self.create_publisher(Imu, '/carla/imu/primary', 10),
+            'backup': self.create_publisher(Imu, '/carla/imu/backup', 10)
+        }
+        self.gnss_pubs = {
+            'front': self.create_publisher(NavSatFix, '/carla/gnss/front', 10),
+            'rear': self.create_publisher(NavSatFix, '/carla/gnss/rear', 10)
+        }
+        self.lidar_pub = self.create_publisher(PointCloud2, '/carla/lidar/top', 10)
+        self.gt_odom_pub = self.create_publisher(Odometry, '/carla/ego_vehicle/odometry', 10)
+        
+        self.radar_pubs = {}
+        for r in ['front', 'rear', 'fl', 'fr', 'rl', 'rr']:
+            self.radar_pubs[r] = self.create_publisher(PointCloud2, f'/carla/radar/{r}', 10)
 
         # Connect to CARLA
         self.connect_to_carla()
         
-        # Timer to tick CARLA and publish frames at 1Hz or 50Hz for integration/testing
-        timer_period = 1.0 if self.integration_mode else 0.02
-        self.timer = self.create_timer(timer_period, self.tick_and_publish)
+        # FORCED 1Hz TICK RATE
+        self.timer = self.create_timer(1.0, self.tick_and_publish)
 
     def connect_to_carla(self):
         self.get_logger().info("Connecting to CARLA on 127.0.0.1:2000...")
@@ -70,7 +87,7 @@ class CarlaNode(Node):
             
         settings = self.world.get_settings()
         settings.synchronous_mode = True
-        settings.fixed_delta_seconds = 1.0 if self.integration_mode else 0.02
+        settings.fixed_delta_seconds = 1.0  # FORCED 1Hz physics step
         self.world.apply_settings(settings)
         
         self.tm = self.client.get_trafficmanager(8000)
@@ -80,11 +97,53 @@ class CarlaNode(Node):
         self.setup_spectator_camera()
 
     def setup_spectator_camera(self):
-        """Set spectator camera to chase view matching dashboard_node VC config"""
-        # Chase camera config from dashboard_node.py VC
         self.spectator_offset = carla.Vector3D(x=-15.0, y=0.0, z=8.0)
         self.spectator_rotation = carla.Rotation(pitch=-20, yaw=0, roll=0)
         self.get_logger().info("Spectator camera initialized (chase view mode)")
+
+    @staticmethod
+    def euler_to_quaternion(yaw, pitch, roll):
+        yaw, pitch, roll = math.radians(yaw), math.radians(pitch), math.radians(roll)
+        cy = math.cos(yaw * 0.5)
+        sy = math.sin(yaw * 0.5)
+        cp = math.cos(pitch * 0.5)
+        sp = math.sin(pitch * 0.5)
+        cr = math.cos(roll * 0.5)
+        sr = math.sin(roll * 0.5)
+        return np.array([
+            cy * cp * cr + sy * sp * sr,
+            cy * cp * sr - sy * sp * cr,
+            sy * cp * sr + cy * sp * cr,
+            sy * cp * cr - cy * sp * sr,
+        ])
+
+    def publish_gt_odometry(self, stamp):
+        if self.ego_vehicle is None or not self.ego_vehicle.is_alive:
+            return
+
+        transform = self.ego_vehicle.get_transform()
+        velocity = self.ego_vehicle.get_velocity()
+
+        odom_msg = Odometry()
+        odom_msg.header.stamp = stamp
+        odom_msg.header.frame_id = 'odom'
+        odom_msg.child_frame_id = 'base_link'
+
+        odom_msg.pose.pose.position.x = transform.location.x
+        odom_msg.pose.pose.position.y = transform.location.y
+        odom_msg.pose.pose.position.z = transform.location.z
+
+        q = self.euler_to_quaternion(transform.rotation.yaw, transform.rotation.pitch, transform.rotation.roll)
+        odom_msg.pose.pose.orientation.w = float(q[0])
+        odom_msg.pose.pose.orientation.x = float(q[1])
+        odom_msg.pose.pose.orientation.y = float(q[2])
+        odom_msg.pose.pose.orientation.z = float(q[3])
+
+        odom_msg.twist.twist.linear.x = velocity.x
+        odom_msg.twist.twist.linear.y = velocity.y
+        odom_msg.twist.twist.linear.z = velocity.z
+
+        self.gt_odom_pub.publish(odom_msg)
 
     def make_sensor_callback(self, name, sensor_type):
         def callback(data):
@@ -93,12 +152,9 @@ class CarlaNode(Node):
 
     def _sensor_callback(self, name, sensor_type, data):
         self.sensor_callback_count += 1
-        if self.sensor_callback_count == 1 or self.sensor_callback_count % 50 == 0:
-            self.get_logger().info(f"CARLA sensor callback #{self.sensor_callback_count}: {name}/{sensor_type}")
         self.sensor_queue.put((name, sensor_type, data))
 
     def update_spectator_camera(self):
-        """Update spectator camera position relative to ego vehicle"""
         if self.ego_vehicle is None or not self.ego_vehicle.is_alive:
             return
         ego_transform = self.ego_vehicle.get_transform()
@@ -138,11 +194,14 @@ class CarlaNode(Node):
         self.ego_vehicle.set_autopilot(True, self.tm.get_port())
         self.get_logger().info("Ego vehicle spawned and autopilot engaged.")
 
+        # Total expected sensors: cameras + 2 IMU + 2 GNSS + 1 LiDAR + 6 Radars
         sensor_types = ['image', 'depth', 'seg'] if self.debug else ['image']
-        self.expected_sensor_frames = len(CAMS) * len(sensor_types)
-        self.get_logger().info(f"Expecting {self.expected_sensor_frames} CARLA camera streams.")
+        self.expected_sensor_frames = (len(CAMS) * len(sensor_types)) + 2 + 2 + 1 + 6
+        self.get_logger().info(f"Expecting {self.expected_sensor_frames} CARLA sensor streams per tick.")
 
-        # Spawn Cameras
+        # ==========================================
+        # CAMERAS
+        # ==========================================
         for name, ext in CAMS.items():
             tf = carla.Transform(
                 carla.Location(x=ext['x'], y=ext['y'], z=ext['z']), 
@@ -153,45 +212,168 @@ class CarlaNode(Node):
                 blueprint.set_attribute('image_size_x', str(ext['w']))
                 blueprint.set_attribute('image_size_y', str(ext['h']))
                 blueprint.set_attribute('fov', str(ext['fov']))
-                blueprint.set_attribute('sensor_tick', '1.0' if self.integration_mode else '0.033')
+                blueprint.set_attribute('sensor_tick', '1.0') # FORCED 1Hz
 
                 cam = self.world.spawn_actor(blueprint, tf, attach_to=self.ego_vehicle)
                 cam.listen(self.make_sensor_callback(name, sensor_type))
                 self.actor_list.append(cam)
-                self.get_logger().info(f"Spawned {sensor_type} camera for {name}.")
+
+        # ==========================================
+        # IMU (Primary & Backup)
+        # ==========================================
+        imu_bp = bp_lib.find('sensor.other.imu')
+        imu_bp.set_attribute('sensor_tick', '1.0') # FORCED 1Hz
+        center_tf = carla.Transform(carla.Location(x=0, z=0))
+        
+        for name in ['primary', 'backup']:
+            imu = self.world.spawn_actor(imu_bp, center_tf, attach_to=self.ego_vehicle)
+            imu.listen(self.make_sensor_callback(name, 'imu'))
+            self.actor_list.append(imu)
+
+        # ==========================================
+        # GNSS (Front & Rear)
+        # ==========================================
+        gnss_bp = bp_lib.find('sensor.other.gnss')
+        gnss_bp.set_attribute('sensor_tick', '1.0') # FORCED 1Hz
+        
+        gnss_f = self.world.spawn_actor(gnss_bp, carla.Transform(carla.Location(x=1.0, z=1.5)), attach_to=self.ego_vehicle)
+        gnss_f.listen(self.make_sensor_callback('front', 'gnss'))
+        self.actor_list.append(gnss_f)
+
+        gnss_r = self.world.spawn_actor(gnss_bp, carla.Transform(carla.Location(x=-1.0, z=1.5)), attach_to=self.ego_vehicle)
+        gnss_r.listen(self.make_sensor_callback('rear', 'gnss'))
+        self.actor_list.append(gnss_r)
+
+        # ==========================================
+        # LIDAR
+        # ==========================================
+        lidar_bp = bp_lib.find('sensor.lidar.ray_cast')
+        lidar_bp.set_attribute('channels', '32')
+        lidar_bp.set_attribute('range', '100')
+        lidar_bp.set_attribute('rotation_frequency', '1') # Matched to 1Hz world tick
+        lidar_bp.set_attribute('points_per_second', '500000')
+        lidar_bp.set_attribute('sensor_tick', '1.0') # FORCED 1Hz
+
+        lidar = self.world.spawn_actor(lidar_bp, carla.Transform(carla.Location(x=0.0, y=0.0, z=1.8)), attach_to=self.ego_vehicle)
+        lidar.listen(self.make_sensor_callback('top', 'lidar'))
+        self.actor_list.append(lidar)
+
+        # ==========================================
+        # RADARS
+        # ==========================================
+        def spawn_radar(name, x, y, z, yaw, h_fov, v_fov, rng):
+            bp = bp_lib.find('sensor.other.radar')
+            bp.set_attribute('horizontal_fov', str(h_fov))
+            bp.set_attribute('vertical_fov', str(v_fov))
+            bp.set_attribute('range', str(rng))
+            bp.set_attribute('sensor_tick', '1.0') # FORCED 1Hz
+            
+            tf = carla.Transform(carla.Location(x=x, y=y, z=z), carla.Rotation(yaw=yaw))
+            radar = self.world.spawn_actor(bp, tf, attach_to=self.ego_vehicle)
+            radar.listen(self.make_sensor_callback(name, 'radar'))
+            self.actor_list.append(radar)
+
+        spawn_radar('front',  2.0,  0.0, 0.5, 0,   30, 15, 100)
+        spawn_radar('rear',  -2.0,  0.0, 0.5, 180, 30, 15, 100)
+        spawn_radar('fl',     1.8, -0.8, 0.5, -45,  90, 30, 30)
+        spawn_radar('fr',     1.8,  0.8, 0.5, 45,   90, 30, 30)
+        spawn_radar('rl',    -1.8, -0.8, 0.5, -135, 90, 30, 30)
+        spawn_radar('rr',    -1.8,  0.8, 0.5, 135,  90, 30, 30)
+
+        self.get_logger().info("All V6 sensors spawned successfully at 1Hz.")
 
     def tick_and_publish(self):
         try:
             self.world.tick()
             self.update_spectator_camera()
+            self.publish_gt_odometry(stamp)
         except Exception as e:
             self.get_logger().error(f"CARLA tick failed: {e}", exc_info=True)
             return
         
         self.tick_counter += 1
-        expected = getattr(self, 'expected_sensor_frames', len(CAMS) * (3 if self.debug else 1))
+        expected = getattr(self, 'expected_sensor_frames', 0)
         gathered = 0
         timeout_start = time.time()
+        stamp = self.get_clock().now().to_msg()
 
         while gathered < expected and (time.time() - timeout_start) < 2.0:
             try:
-                cam_name, sensor_type, data = self.sensor_queue.get(timeout=0.1)
-                bgra = np.frombuffer(data.raw_data, dtype=np.uint8).reshape(data.height, data.width, 4)
+                name, sensor_type, data = self.sensor_queue.get(timeout=0.1)
 
-                if sensor_type == 'image':
-                    bgr = bgra[:, :, :3]
-                    msg = self.bridge.cv2_to_imgmsg(bgr, encoding='bgr8')
-                else:
-                    msg = self.bridge.cv2_to_imgmsg(bgra, encoding='bgra8')
+                # Process Vision Sensors
+                if sensor_type in ['image', 'depth', 'seg']:
+                    bgra = np.frombuffer(data.raw_data, dtype=np.uint8).reshape(data.height, data.width, 4)
+                    if sensor_type == 'image':
+                        msg = self.bridge.cv2_to_imgmsg(bgra[:, :, :3], encoding='bgr8')
+                    else:
+                        msg = self.bridge.cv2_to_imgmsg(bgra, encoding='bgra8')
+                    msg.header.stamp = stamp
+                    msg.header.frame_id = name
+                    self.publishers_dict[name][sensor_type].publish(msg)
 
-                msg.header.stamp = self.get_clock().now().to_msg()
-                msg.header.frame_id = cam_name
-                self.publishers_dict[cam_name][sensor_type].publish(msg)
+                # Process IMU
+                elif sensor_type == 'imu':
+                    msg = Imu()
+                    msg.header.stamp = stamp
+                    msg.header.frame_id = f"imu_{name}"
+                    msg.linear_acceleration.x = data.accelerometer.x
+                    msg.linear_acceleration.y = data.accelerometer.y
+                    msg.linear_acceleration.z = data.accelerometer.z
+                    msg.angular_velocity.x = data.gyroscope.x
+                    msg.angular_velocity.y = data.gyroscope.y
+                    msg.angular_velocity.z = data.gyroscope.z
+                    self.imu_pubs[name].publish(msg)
+
+                # Process GNSS
+                elif sensor_type == 'gnss':
+                    msg = NavSatFix()
+                    msg.header.stamp = stamp
+                    msg.header.frame_id = f"gnss_{name}"
+                    msg.latitude = data.latitude
+                    msg.longitude = data.longitude
+                    msg.altitude = data.altitude
+                    self.gnss_pubs[name].publish(msg)
+
+                # Process LiDAR
+                elif sensor_type == 'lidar':
+                    points = np.frombuffer(data.raw_data, dtype=np.float32)
+                    points = np.reshape(points, (int(points.shape[0] / 4), 4))
+                    fields = [
+                        PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
+                        PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
+                        PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
+                        PointField(name='intensity', offset=12, datatype=PointField.FLOAT32, count=1),
+                    ]
+                    msg = pc2.create_cloud(Header(frame_id=f'lidar_{name}', stamp=stamp), fields, points)
+                    self.lidar_pub.publish(msg)
+
+                # Process Radar (Converted to PointCloud2 for easy handling in ROS)
+                elif sensor_type == 'radar':
+                    points = np.frombuffer(data.raw_data, dtype=np.float32)
+                    points = np.reshape(points, (int(points.shape[0] / 4), 4))
+                    
+                    # Convert radar Depth, Azimuth, Altitude to XYZ
+                    depth, azimuth, alt, vel = points[:, 0], points[:, 1], points[:, 2], points[:, 3]
+                    x = depth * np.cos(alt) * np.cos(azimuth)
+                    y = depth * np.cos(alt) * np.sin(azimuth)
+                    z = depth * np.sin(alt)
+                    
+                    radar_points = np.column_stack((x, y, z, vel))
+                    fields = [
+                        PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
+                        PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
+                        PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
+                        PointField(name='velocity', offset=12, datatype=PointField.FLOAT32, count=1),
+                    ]
+                    msg = pc2.create_cloud(Header(frame_id=f'radar_{name}', stamp=stamp), fields, radar_points)
+                    self.radar_pubs[name].publish(msg)
+
                 gathered += 1
             except queue.Empty:
                 continue
             except Exception as e:
-                self.get_logger().error(f"Failed to publish CARLA sensor frame: {e}", exc_info=True)
+                self.get_logger().error(f"Failed to publish CARLA {sensor_type} frame: {e}", exc_info=True)
                 continue
 
         if gathered == 0:
@@ -202,8 +384,6 @@ class CarlaNode(Node):
             self.get_logger().warn(
                 f"CARLA tick produced partial data {gathered}/{expected}; queue size={self.sensor_queue.qsize()}"
             )
-        elif self.debug and self.tick_counter % 50 == 0:
-            self.get_logger().info(f"CARLA tick published {gathered}/{expected} frames; queue size={self.sensor_queue.qsize()}")
 
     def destroy_node(self):
         self.get_logger().info("Shutting down CARLA node and cleaning up actors...")

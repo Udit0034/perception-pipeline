@@ -2,7 +2,7 @@ import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch.conditions import IfCondition
 from launch_ros.actions import Node
 
@@ -63,18 +63,42 @@ def generate_launch_description():
         parameters=[{'debug': debug_config}]
     )
 
-    rviz_config = os.path.join(
+    ekf_node = Node(
+        package='perception_pipeline',
+        executable='ekf_node',
+        name='ekf_node',
+        output='screen'
+    )
+
+    vo_node = Node(
+        package='perception_pipeline',
+        executable='visual_odometry_node',
+        name='visual_odometry_node',
+        output='screen',
+        condition=IfCondition(debug_config)
+    )
+
+    eval_debug_rviz = os.path.join(
         get_package_share_directory('perception_pipeline'),
         'rviz',
-        'dashboard.rviz'
+        'eval_debug.rviz'
     )
+    eval_inference_rviz = os.path.join(
+        get_package_share_directory('perception_pipeline'),
+        'rviz',
+        'eval_inference.rviz'
+    )
+
+    rviz_config_file = PythonExpression([
+        "'", eval_debug_rviz, "' if ", debug_config, " else '", eval_inference_rviz, "'"
+    ])
 
     rviz_node = Node(
         package='rviz2',
         executable='rviz2',
         name='dashboard_rviz',
         output='screen',
-        arguments=['-d', rviz_config],
+        arguments=['-d', rviz_config_file],
         condition=IfCondition(with_rviz)
     )
 
@@ -89,5 +113,7 @@ def generate_launch_description():
         inference_node,
         evaluate_node,
         dashboard_node,
+        ekf_node,
+        vo_node,
         rviz_node
     ])
