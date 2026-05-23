@@ -1,7 +1,9 @@
 import rclpy
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from std_msgs.msg import Header
-from sensor_msgs.msg import Image, Imu, NavSatFix, PointCloud2, PointField
+from std_msgs.msg import Header, Bool
+from sensor_msgs.msg import CompressedImage, Image, Imu, NavSatFix, PointCloud2, PointField
 from nav_msgs.msg import Odometry
 import sensor_msgs_py.point_cloud2 as pc2
 from cv_bridge import CvBridge
@@ -38,6 +40,10 @@ class CarlaNode(Node):
         self.integration_mode = self.get_parameter('integration_mode').get_parameter_value().bool_value
         self.get_logger().info(f"CARLA debug mode: {self.debug} | integration_mode: {self.integration_mode}")
 
+        # Execution isolation / heartbeat sync
+        self.control_group = ReentrantCallbackGroup()
+        self.waiting_for_perception = False
+
         # Tools
         self.bridge = CvBridge()
         self.sensor_queue = queue.Queue()
@@ -50,6 +56,7 @@ class CarlaNode(Node):
         for cam_name in CAMS.keys():
             self.publishers_dict[cam_name] = {}
             self.publishers_dict[cam_name]['image'] = self.create_publisher(Image, f'/carla/{cam_name}/image', 10)
+            self.publishers_dict[cam_name]['image_compressed'] = self.create_publisher(CompressedImage, f'/carla/{cam_name}/image/compressed', 10)
             if self.debug:
                 self.publishers_dict[cam_name]['depth'] = self.create_publisher(Image, f'/carla/{cam_name}/depth', 10)
                 self.publishers_dict[cam_name]['seg'] = self.create_publisher(Image, f'/carla/{cam_name}/seg', 10)
@@ -72,26 +79,44 @@ class CarlaNode(Node):
 
         # Connect to CARLA
         self.connect_to_carla()
-        
-        # FORCED 1Hz TICK RATE
-        self.timer = self.create_timer(1.0, self.tick_and_publish)
+
+        self.heartbeat_sub = self.create_subscription(
+            Bool,
+            '/perception/heartbeat',
+            self.perception_heartbeat_callback,
+            10
+        )
+
+        self.last_tick_time = time.time()
+        self.waiting_for_perception = False
+
+        # Dedicated 20Hz control timer for physics and autopilot
+        self.control_timer = self.create_timer(0.05, self.control_tick, callback_group=self.control_group)
+        self.sensor_timer = self.create_timer(0.01, self.tick_and_publish)
 
     def connect_to_carla(self):
         self.get_logger().info("Connecting to CARLA on 127.0.0.1:2000...")
         self.client = carla.Client('127.0.0.1', 2000)
-        self.client.set_timeout(60.0)
+        self.client.set_timeout(80.0)
         
         self.world = self.client.get_world()
         if self.world.get_map().name.split('/')[-1] != 'Town01':
             self.world = self.client.load_world('Town01')
             
         settings = self.world.get_settings()
-        settings.synchronous_mode = True
-        settings.fixed_delta_seconds = 1.0  # FORCED 1Hz physics step
+        settings.synchronous_mode = False
+
+        # 0.05s fixed delta = 20Hz Simulation Rate
+        settings.fixed_delta_seconds = 0.05
+        settings.substepping = True
+        settings.max_substep_delta_time = 0.01
+        settings.max_substeps = 5  # 0.01 * 5 = 0.05 (Matches fixed_delta_seconds exactly!)
+
         self.world.apply_settings(settings)
         
-        self.tm = self.client.get_trafficmanager(8000)
-        self.tm.set_synchronous_mode(True)
+        traffic_manager = self.client.get_trafficmanager(8000)
+        traffic_manager.set_synchronous_mode(True)
+        self.tm = traffic_manager
 
         self.spawn_ego_and_sensors()
         self.setup_spectator_camera()
@@ -282,22 +307,38 @@ class CarlaNode(Node):
 
         self.get_logger().info("All V6 sensors spawned successfully at 1Hz.")
 
-    def tick_and_publish(self):
+    def control_tick(self):
+        if self.waiting_for_perception:
+            if time.time() - self.last_tick_time > 5.0:
+                self.get_logger().warn("Perception timeout! Forcing a tick to prevent deadlock.")
+                self.waiting_for_perception = False
+            else:
+                return
+
+        stamp = self.get_clock().now().to_msg()
         try:
             self.world.tick()
             self.update_spectator_camera()
             self.publish_gt_odometry(stamp)
         except Exception as e:
-            self.get_logger().error(f"CARLA tick failed: {e}", exc_info=True)
+            self.get_logger().error(f"CARLA control tick failed: {e}")
             return
-        
+
         self.tick_counter += 1
+        self.last_tick_time = time.time()
+        self.waiting_for_perception = True
+
+    def perception_heartbeat_callback(self, msg):
+        if msg.data:
+            self.waiting_for_perception = False
+
+    def tick_and_publish(self):
+        stamp = self.get_clock().now().to_msg()
         expected = getattr(self, 'expected_sensor_frames', 0)
         gathered = 0
         timeout_start = time.time()
-        stamp = self.get_clock().now().to_msg()
 
-        while gathered < expected and (time.time() - timeout_start) < 2.0:
+        while gathered < expected and (time.time() - timeout_start) < 10.0:
             try:
                 name, sensor_type, data = self.sensor_queue.get(timeout=0.1)
 
@@ -306,6 +347,10 @@ class CarlaNode(Node):
                     bgra = np.frombuffer(data.raw_data, dtype=np.uint8).reshape(data.height, data.width, 4)
                     if sensor_type == 'image':
                         msg = self.bridge.cv2_to_imgmsg(bgra[:, :, :3], encoding='bgr8')
+                        compressed_msg = self.bridge.cv2_to_compressed_imgmsg(bgra[:, :, :3], dst_format='jpeg')
+                        compressed_msg.header.stamp = stamp
+                        compressed_msg.header.frame_id = name
+                        self.publishers_dict[name]['image_compressed'].publish(compressed_msg)
                     else:
                         msg = self.bridge.cv2_to_imgmsg(bgra, encoding='bgra8')
                     msg.header.stamp = stamp
@@ -373,7 +418,7 @@ class CarlaNode(Node):
             except queue.Empty:
                 continue
             except Exception as e:
-                self.get_logger().error(f"Failed to publish CARLA {sensor_type} frame: {e}", exc_info=True)
+                self.get_logger().error(f"Failed to publish CARLA {sensor_type} frame: {e}")
                 continue
 
         if gathered == 0:
@@ -392,20 +437,24 @@ class CarlaNode(Node):
                 if actor.is_alive:
                     actor.destroy()
             except Exception as e:
-                self.get_logger().error(f"Failed to destroy CARLA actor: {e}", exc_info=True)
+                self.get_logger().error(f"Failed to destroy CARLA actor: {e}")
         self.actor_list.clear()
         super().destroy_node()
 
 def main(args=None):
     rclpy.init(args=args)
     node = CarlaNode()
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
+        executor.shutdown()
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 if __name__ == '__main__':
     main()

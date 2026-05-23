@@ -120,7 +120,8 @@ def main(args=None):
         builder_node.get_logger().error(f"Engine Compilation Interrupted: {e}")
     finally:
         builder_node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 if __name__ == '__main__':
     main()

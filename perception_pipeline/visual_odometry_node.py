@@ -10,7 +10,7 @@ import numpy as np
 import math
 
 # ==========================================
-# PLACEHOLDER VO CLASS (Your Logic)
+# LIGHTWEIGHT VO CLASS 
 # ==========================================
 class VisualOdometry:
     def __init__(self, fov=90.0, width=512, height=256):
@@ -40,22 +40,30 @@ class VisualOdometry:
         self.global_pitch = 0.0
         self.global_yaw = 0.0
 
-        # Tracker Params
-        self.lk_params = dict(winSize=(21, 21), maxLevel=3,
-                              criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
-        self.feature_params = dict(maxCorners=1000, qualityLevel=0.01, minDistance=10, blockSize=3)
+        # ---------------------------------------------------------
+        # ⬇️ PERFORMANCE LIMITERS: REDUCED FEATURES & TRACKING MATH
+        # ---------------------------------------------------------
+        # winSize 15x15 and maxLevel 2 drastically reduces optical flow CPU usage
+        self.lk_params = dict(winSize=(15, 15), maxLevel=2,
+                              criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
+        
+        # maxCorners reduced from 1000 to 250. Higher quality and minDistance 
+        # forces it to only pick the absolute best, spread-out features.
+        self.feature_params = dict(maxCorners=250, qualityLevel=0.05, minDistance=20, blockSize=3)
 
     def initialize(self, rgb, depth, x, y, z, roll, pitch, yaw):
         """Initializes the VO tracker with the first frame and starting pose."""
         self.prev_img = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
         self.prev_depth = depth.copy()
+        
+        # Extract initial limited feature set
         self.prev_kps = cv2.goodFeaturesToTrack(self.prev_img, mask=None, **self.feature_params)
         
         self.global_x, self.global_y, self.global_z = x, y, z
         self.global_roll, self.global_pitch, self.global_yaw = roll, pitch, yaw
         
         self.initialized = True
-        print(f"✅ [VO] RGB-D Odometry Initialized at ({x:.2f}, {y:.2f}, {z:.2f})")
+        print(f"✅ [VO] Lightweight RGB-D Odometry Initialized at ({x:.2f}, {y:.2f}, {z:.2f})")
 
     def process_frame(self, rgb, depth):
         """Computes odometry using the new RGB frame and Depth map."""
@@ -64,8 +72,11 @@ class VisualOdometry:
 
         # ==========================================
         # PLACEHOLDER: Your KLT / PnP logic goes here
-        # (Assuming it calculates self.global_x, etc.)
         # ==========================================
+        
+        # If your tracked features drop too low, remember to re-extract using self.feature_params
+        # if len(self.prev_kps) < 50:
+        #     self.prev_kps = cv2.goodFeaturesToTrack(...)
 
         return self.global_x, self.global_y, self.global_z, self.global_roll, self.global_pitch, self.global_yaw
 
@@ -79,6 +90,10 @@ class VisualOdometryNode(Node):
 
         self.bridge = CvBridge()
         self.vo = VisualOdometry()
+
+        # Throttling to save CPU: 1 = process every frame, 2 = process half the frames
+        self.frame_counter = 0
+        self.process_every_n_frames = 2 
 
         # Publisher for the resulting Odometry
         self.odom_pub = self.create_publisher(Odometry, '/vo/odometry', 10)
@@ -95,10 +110,15 @@ class VisualOdometryNode(Node):
         )
         self.ts.registerCallback(self.sync_callback)
 
-        self.get_logger().info("Visual Odometry Node started, waiting for synchronized RGB-D frames...")
+        self.get_logger().info("Lightweight Visual Odometry Node started...")
 
     def sync_callback(self, rgb_msg, depth_msg):
         """Called only when a matching RGB and Depth frame arrive together."""
+        # ⬇️ THROTTLE LOGIC: Skip frames to save CPU
+        self.frame_counter += 1
+        if self.frame_counter % self.process_every_n_frames != 0:
+            return
+
         try:
             # 1. Convert ROS messages to OpenCV formats
             cv_rgb = self.bridge.imgmsg_to_cv2(rgb_msg, desired_encoding='bgr8')
@@ -157,7 +177,8 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 if __name__ == '__main__':
     main()

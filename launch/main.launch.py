@@ -90,7 +90,11 @@ def generate_launch_description():
     )
 
     rviz_config_file = PythonExpression([
-        "'", eval_debug_rviz, "' if ", debug_config, " else '", eval_inference_rviz, "'"
+        "'", debug_config, "' == 'true' and '", eval_debug_rviz, "' or '", eval_inference_rviz, "'"
+    ])
+
+    rviz_enabled = PythonExpression([
+        "'", debug_config, "' == 'true' or '", with_rviz, "' == 'true'"
     ])
 
     rviz_node = Node(
@@ -99,7 +103,7 @@ def generate_launch_description():
         name='dashboard_rviz',
         output='screen',
         arguments=['-d', rviz_config_file],
-        condition=IfCondition(with_rviz)
+        condition=IfCondition(rviz_enabled)
     )
 
     # Note: EngineBuilderNode is usually run once offline to build the cache, 

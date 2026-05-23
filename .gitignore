@@ -1,5 +1,6 @@
 # ROS 2 build folders
 build/
+eval_plots/
 install/
 log/
 

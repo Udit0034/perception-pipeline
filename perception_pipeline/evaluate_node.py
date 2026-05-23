@@ -113,7 +113,7 @@ class EvaluateNode(Node):
             sub_gt_s = message_filters.Subscriber(self, Image, f'/carla/{cam_name}/seg', callback_group=self.callback_group)
             subscribers.extend([sub_gt_d, sub_gt_s])
 
-        ts = message_filters.ApproximateTimeSynchronizer(subscribers, queue_size=10, slop=0.15)
+        ts = message_filters.ApproximateTimeSynchronizer(subscribers, queue_size=30, slop=0.15)
         ts.registerCallback(lambda *msgs, name=cam_name: self.eval_callback(name, *msgs))
         return ts
 
@@ -451,7 +451,8 @@ def main(args=None):
     finally:
         executor.shutdown()
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 if __name__ == '__main__':
     

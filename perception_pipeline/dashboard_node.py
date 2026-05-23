@@ -312,7 +312,7 @@ class DashboardNode(Node):
             self.pub_pred_chase.publish(self.bridge.cv2_to_imgmsg(chase, encoding="bgr8", header=header))
             self.pub_pred_occ.publish(self.bridge.cv2_to_imgmsg(occ, encoding="bgr8", header=header))
         except Exception as e:
-            self.get_logger().error(f"Dashboard prediction callback failed: {e}", exc_info=True)
+            self.get_logger().error(f"Dashboard prediction callback failed: {e}")
 
     def gt_callback(self, *msgs):
         try:
@@ -337,7 +337,7 @@ class DashboardNode(Node):
             self.pub_gt_chase.publish(self.bridge.cv2_to_imgmsg(chase, encoding="bgr8", header=header))
             self.pub_gt_occ.publish(self.bridge.cv2_to_imgmsg(occ, encoding="bgr8", header=header))
         except Exception as e:
-            self.get_logger().error(f"Dashboard GT callback failed: {e}", exc_info=True)
+            self.get_logger().error(f"Dashboard GT callback failed: {e}")
 
 def main(args=None):
     rclpy.init(args=args)
@@ -351,7 +351,8 @@ def main(args=None):
     finally:
         executor.shutdown()
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
