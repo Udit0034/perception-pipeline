@@ -15,10 +15,10 @@ from cv_bridge import CvBridge
 CAMERA_NAMES = ["front_left", "rear", "side_left", "side_right"]
 
 CAMS = {
-    "front_left": {"fov": 90, "w": 1280, "h": 720, "x": 1.4, "y": -0.25, "z": 1.5, "pitch": -12.0, "yaw": 0.0, "roll": 0.0},
-    "rear": {"fov": 100, "w": 800, "h": 400, "x": -2.0, "y": 0.0, "z": 1.6, "pitch": -26.0, "yaw": 180.0, "roll": 0.0},
-    "side_left": {"fov": 120, "w": 800, "h": 400, "x": 0.0, "y": -0.8, "z": 1.8, "pitch": -41.0, "yaw": -90.0, "roll": 0.0},
-    "side_right": {"fov": 120, "w": 800, "h": 400, "x": 0.0, "y": 0.8, "z": 1.8, "pitch": -41.0, "yaw": 90.0, "roll": 0.0},
+    "front_left": {"fov": 90, "w": 1280, "h": 720, "x": 1.4, "y": -0.25, "z": 1.5, "pitch": -12.0, "yaw": 0.0, "roll": 0.0, "max_depth": 250.0},
+    "rear": {"fov": 100, "w": 800, "h": 400, "x": -2.0, "y": 0.0, "z": 1.6, "pitch": -26.0, "yaw": 180.0, "roll": 0.0, "max_depth": 150.0},
+    "side_left": {"fov": 120, "w": 800, "h": 400, "x": 0.0, "y": -0.8, "z": 1.8, "pitch": -41.0, "yaw": -90.0, "roll": 0.0, "max_depth": 80.0},
+    "side_right": {"fov": 120, "w": 800, "h": 400, "x": 0.0, "y": 0.8, "z": 1.8, "pitch": -41.0, "yaw": 90.0, "roll": 0.0, "max_depth": 80.0},
 }
 
 VC = {
@@ -54,6 +54,15 @@ def rot(pitch, yaw, roll):
     Ry = np.array([[np.cos(p), 0, -np.sin(p)], [0, 1, 0], [np.sin(p), 0, np.cos(p)]])
     Rz = np.array([[np.cos(y), -np.sin(y), 0], [np.sin(y), np.cos(y), 0], [0, 0, 1]])
     return Rz @ Ry @ Rx
+
+
+def make_homogeneous_transform(cam):
+    R = rot(cam["pitch"], cam["yaw"], cam["roll"]).astype(np.float32)
+    T = np.array([[cam["x"]], [cam["y"]], [cam["z"]]], dtype=np.float32)
+    M = np.eye(4, dtype=np.float32)
+    M[:3, :3] = R
+    M[:3, 3:] = T
+    return M
 
 # ==========================================================
 # TEMPORAL GRIDS
@@ -198,6 +207,10 @@ class DashboardNode(Node):
 
         self.get_logger().info(f"📊 Dashboard Live | Debug (GT) enabled: {self.debug}")
         self.callback_group = ReentrantCallbackGroup()
+        self.cam_transforms = {
+            cam_name: make_homogeneous_transform(CAMS[cam_name])
+            for cam_name in CAMERA_NAMES
+        }
 
         # Setup Prediction Synchronizer (8 topics)
         pred_subs = []
@@ -245,27 +258,26 @@ class DashboardNode(Node):
                 depth = depth * 1000.0
 
             cam = CAMS[cam_name]
+            max_range = cam["max_depth"]
+            valid = np.isfinite(depth) & (depth > 0.5) & (depth < max_range)
+            if not np.any(valid):
+                continue
+
+            ys, xs = np.nonzero(valid)
+            Z = depth[ys, xs]
+            seg_flat = seg[ys, xs]
+            seg_colors = seg_to_rgb(seg)
+            colors = seg_colors[ys, xs]
+
             h, w = depth.shape
             fx, fy, cx, cy = intrinsics(w, h, cam["fov"])
-            
-            u, v = np.meshgrid(np.arange(w), np.arange(h))
-            u, v, Z = u.flatten(), v.flatten(), depth.flatten()
-            colors = seg_to_rgb(seg).reshape(-1, 3)
-            seg_flat = seg.flatten()
-            
-            valid = np.isfinite(Z) & (Z > 0.5) & (Z < 150)
-            u, v, Z, colors, seg_flat = u[valid], v[valid], Z[valid], colors[valid], seg_flat[valid]
-            if len(Z) == 0: continue
-            
-            X = (u - cx) * Z / fx
-            Y = (v - cy) * Z / fy
-            pts_cam = np.vstack((Z, X, -Y))
-            R_cam = rot(cam["pitch"], cam["yaw"], cam["roll"])
-            pts_vehicle = (R_cam @ pts_cam)
-            
-            pts_vehicle[0] += cam["x"]
-            pts_vehicle[1] += cam["y"]
-            pts_vehicle[2] += cam["z"]
+            X = (xs.astype(np.float32) - cx) * Z / fx
+            Y = (ys.astype(np.float32) - cy) * Z / fy
+
+            ones = np.ones_like(Z, dtype=np.float32)
+            pts_cam = np.vstack((Z, X, -Y, ones))
+            pts_vehicle_h = self.cam_transforms[cam_name] @ pts_cam
+            pts_vehicle = pts_vehicle_h[:3, :]
             
             all_pts.append(pts_vehicle)
             all_colors.append(colors)

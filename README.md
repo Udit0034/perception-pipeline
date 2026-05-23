@@ -92,8 +92,8 @@ Parallel Processing: All 8 models run concurrently via ThreadPoolExecutor
 - Connects to CARLA at `127.0.0.1:2000` with 60s timeout
 - Spawns Tesla Model 3 with autopilot enabled
 - Configurable camera setup (5 or 15 sensors)
-- Synchronous world tick at 0.02s (50 Hz)
-- Camera sensors configured with `sensor_tick=0.033` for 30 Hz capture
+- Synchronous world tick at `0.02s` (50 Hz), or `1.0s` when `integration_mode` is enabled for testing
+- Camera sensors configured with `sensor_tick=0.033` for 30 Hz capture, or `1.0` for 1 Hz integration testing
 
 **Parameters:**
 - `debug` (bool, default: `false`)

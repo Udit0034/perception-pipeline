@@ -28,8 +28,10 @@ class CarlaNode(Node):
         
         # Parameters
         self.declare_parameter('debug', False)
+        self.declare_parameter('integration_mode', False)
         self.debug = self.get_parameter('debug').get_parameter_value().bool_value
-        self.get_logger().info(f"CARLA debug mode: {self.debug}")
+        self.integration_mode = self.get_parameter('integration_mode').get_parameter_value().bool_value
+        self.get_logger().info(f"CARLA debug mode: {self.debug} | integration_mode: {self.integration_mode}")
 
         # Tools
         self.bridge = CvBridge()
@@ -53,8 +55,9 @@ class CarlaNode(Node):
         # Connect to CARLA
         self.connect_to_carla()
         
-        # Timer to tick CARLA and publish frames at 10Hz (0.1 seconds)
-        self.timer = self.create_timer(0.1, self.tick_and_publish)
+        # Timer to tick CARLA and publish frames at 1Hz or 50Hz for integration/testing
+        timer_period = 1.0 if self.integration_mode else 0.02
+        self.timer = self.create_timer(timer_period, self.tick_and_publish)
 
     def connect_to_carla(self):
         self.get_logger().info("Connecting to CARLA on 127.0.0.1:2000...")
@@ -67,7 +70,7 @@ class CarlaNode(Node):
             
         settings = self.world.get_settings()
         settings.synchronous_mode = True
-        settings.fixed_delta_seconds = 0.02
+        settings.fixed_delta_seconds = 1.0 if self.integration_mode else 0.02
         self.world.apply_settings(settings)
         
         self.tm = self.client.get_trafficmanager(8000)
@@ -150,7 +153,7 @@ class CarlaNode(Node):
                 blueprint.set_attribute('image_size_x', str(ext['w']))
                 blueprint.set_attribute('image_size_y', str(ext['h']))
                 blueprint.set_attribute('fov', str(ext['fov']))
-                blueprint.set_attribute('sensor_tick', '0.0')
+                blueprint.set_attribute('sensor_tick', '1.0' if self.integration_mode else '0.033')
 
                 cam = self.world.spawn_actor(blueprint, tf, attach_to=self.ego_vehicle)
                 cam.listen(self.make_sensor_callback(name, sensor_type))
