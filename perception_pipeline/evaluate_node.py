@@ -67,14 +67,12 @@ class EvaluateNode(Node):
     def __init__(self):
         super().__init__('evaluate_node')
         
-        # 1. Parameter Declarations
         self.declare_parameter('debug', False)
         self.debug = self.get_parameter('debug').get_parameter_value().bool_value
         
         self.bridge = CvBridge()
         self.callback_group = ReentrantCallbackGroup()
         
-        # 2. Vision Tracking Dictionaries
         self.stats = {
             cam: {'rmse': [], 'd1': [], 'miou': []} 
             for cam in CAM_CAPS.keys()
@@ -83,16 +81,13 @@ class EvaluateNode(Node):
         self.last_timestamps = {cam: None for cam in CAM_CAPS.keys()}
         self.fps_records = {cam: collections.deque(maxlen=30) for cam in CAM_CAPS.keys()}
         
-        # 3. EKF/Odom In-Memory Storage (No CSVs)
         self.gt_data = []
         self.ekf_data = []
         
-        # 4. Setup Synchronized Subscribers per Camera
         self.sync_handlers = {}
         for cam in CAM_CAPS.keys():
             self.sync_handlers[cam] = self.create_cam_sync(cam)
             
-        # 5. Odometry Subscribers
         self.sub_gt_odom = self.create_subscription(Odometry, '/carla/ego_vehicle/odometry', self.gt_odom_callback, 10, callback_group=self.callback_group)
         self.sub_ekf_odom = self.create_subscription(Odometry, '/ekf/odometry', self.ekf_odom_callback, 10, callback_group=self.callback_group)
             
@@ -201,8 +196,10 @@ class EvaluateNode(Node):
 
         self.gt_data.append({
             'Timestamp': t, 'Loc_X': pos.x, 'Loc_Y': pos.y, 'Loc_Z': pos.z,
-            'Yaw_Degrees': math.degrees(yaw), 'Pitch_Degrees': math.degrees(pitch), 
-            'Roll_Degrees': math.degrees(roll), 'GT_Velocity': speed
+            'Yaw_Degrees': math.degrees(yaw), 
+            'Pitch_Degrees': -math.degrees(pitch),  # ⬅️ FIXED: Inverted CARLA Left-Hand Pitch to match EKF
+            'Roll_Degrees': -math.degrees(roll),    # ⬅️ FIXED: Inverted CARLA Left-Hand Roll to match EKF
+            'GT_Velocity': speed
         })
 
     def ekf_odom_callback(self, msg: Odometry):
@@ -213,7 +210,6 @@ class EvaluateNode(Node):
         v = msg.twist.twist.linear
         yaw, pitch, roll = quaternion_to_euler(q.w, q.x, q.y, q.z)
         
-        # Standard Odometry has 36-element covariance (6x6). Index 0 is X variance, 7 is Y variance.
         cov_x = msg.pose.covariance[0] if len(msg.pose.covariance) == 36 else 0.0
         cov_y = msg.pose.covariance[7] if len(msg.pose.covariance) == 36 else 0.0
 
@@ -230,7 +226,6 @@ class EvaluateNode(Node):
     def destroy_node(self):
         self.get_logger().info("\n" + "="*60)
         
-        # 1. VISION METRICS 
         if self.debug:
             self.get_logger().info("🛑 RUN FINISHED: CALCULATING FINAL AVERAGE METRICS")
             self.get_logger().info("="*60)
@@ -252,7 +247,6 @@ class EvaluateNode(Node):
 
             print("=" * 75)
             
-            # Save Vision JSON
             save_path = os.path.join(os.getcwd(), 'metrics.json')
             try:
                 with open(save_path, 'w') as f: json.dump(final_metrics, f, indent=4)
@@ -260,7 +254,6 @@ class EvaluateNode(Node):
             except Exception as e:
                 self.get_logger().error(f"❌ Failed to save metrics.json: {e}")
 
-            # 2. TRIGGER EKF PLOTTING
             if len(self.gt_data) > 0 and len(self.ekf_data) > 0:
                 self.generate_ekf_plots()
             else:
@@ -278,7 +271,6 @@ class EvaluateNode(Node):
         super().destroy_node()
 
     def generate_ekf_plots(self):
-        """Converts collected topic dictionaries to DataFrames and runs your plot suite"""
         run_dir = os.path.join(os.getcwd(), 'eval_plots')
         os.makedirs(run_dir, exist_ok=True)
         self.get_logger().info(f"\n--- Generating EKF Plotting Suite in {run_dir} ---")
@@ -288,12 +280,27 @@ class EvaluateNode(Node):
         odom_df = pd.DataFrame(self.gt_data).sort_values('Timestamp')
         m1_df = pd.DataFrame(self.ekf_data).sort_values('Timestamp')
 
-        # Merge GT with EKF (Mode 1 equivalent)
         merged = pd.merge_asof(m1_df, odom_df, on='Timestamp', direction='nearest').dropna()
 
         if merged.empty:
             self.get_logger().error("Merge failed: Timestamps out of sync between GT and EKF.")
             return
+
+        # ==========================================
+        # FIX: ORIGIN ALIGNMENT (EKF Local -> GT Global)
+        # ==========================================
+        offset_x = merged['Loc_X'].iloc[0] - merged['Est_X'].iloc[0]
+        offset_y = merged['Loc_Y'].iloc[0] - merged['Est_Y'].iloc[0]
+        offset_z = merged['Loc_Z'].iloc[0] - merged['Est_Z'].iloc[0]
+
+        merged['Est_X'] += offset_x
+        merged['Est_Y'] += offset_y
+        merged['Est_Z'] += offset_z
+
+        # Also shift m1_df so the raw trajectory plot line aligns
+        m1_df['Est_X'] += offset_x
+        m1_df['Est_Y'] += offset_y
+        m1_df['Est_Z'] += offset_z
 
         # Core Metrics
         merged['error_x'] = merged['Est_X'] - merged['Loc_X']
@@ -446,7 +453,6 @@ def main(args=None):
     try:
         executor.spin()
     except KeyboardInterrupt:
-        # Ctrl+C triggers destroy_node naturally, generating the plots
         pass
     finally:
         executor.shutdown()
@@ -455,5 +461,4 @@ def main(args=None):
             rclpy.shutdown()
 
 if __name__ == '__main__':
-    
     main()

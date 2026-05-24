@@ -33,35 +33,19 @@ class CarlaNode(Node):
     def __init__(self):
         super().__init__('carla_node')
         
-        # Parameters
         self.declare_parameter('debug', False)
         self.declare_parameter('integration_mode', False)
         self.debug = self.get_parameter('debug').get_parameter_value().bool_value
         self.integration_mode = self.get_parameter('integration_mode').get_parameter_value().bool_value
         self.get_logger().info(f"CARLA debug mode: {self.debug} | integration_mode: {self.integration_mode}")
 
-        # Execution isolation / heartbeat sync
-        self.control_group = ReentrantCallbackGroup()
-        self.waiting_for_perception = False
-
-        # Tools
         self.bridge = CvBridge()
         self.sensor_queue = queue.Queue()
+        self.sensor_callback_count = 0  # <--- ADD THIS LINE
         self.actor_list = []
-        self.tick_counter = 0
-        self.sensor_callback_count = 0
-        
-        # ROS2 Publishers for Cameras
-        self.publishers_dict = {}
-        for cam_name in CAMS.keys():
-            self.publishers_dict[cam_name] = {}
-            self.publishers_dict[cam_name]['image'] = self.create_publisher(Image, f'/carla/{cam_name}/image', 10)
-            self.publishers_dict[cam_name]['image_compressed'] = self.create_publisher(CompressedImage, f'/carla/{cam_name}/image/compressed', 10)
-            if self.debug:
-                self.publishers_dict[cam_name]['depth'] = self.create_publisher(Image, f'/carla/{cam_name}/depth', 10)
-                self.publishers_dict[cam_name]['seg'] = self.create_publisher(Image, f'/carla/{cam_name}/seg', 10)
+        self.running = True
 
-        # ROS2 Publishers for V6 Suite
+        # ROS2 Publishers
         self.imu_pubs = {
             'primary': self.create_publisher(Imu, '/carla/imu/primary', 10),
             'backup': self.create_publisher(Imu, '/carla/imu/backup', 10)
@@ -70,52 +54,39 @@ class CarlaNode(Node):
             'front': self.create_publisher(NavSatFix, '/carla/gnss/front', 10),
             'rear': self.create_publisher(NavSatFix, '/carla/gnss/rear', 10)
         }
-        self.lidar_pub = self.create_publisher(PointCloud2, '/carla/lidar/top', 10)
+        self.camera_pubs = {
+            'front_left': self.create_publisher(Image, '/carla/front_left/image_raw', 10)
+        }
         self.gt_odom_pub = self.create_publisher(Odometry, '/carla/ego_vehicle/odometry', 10)
         
-        self.radar_pubs = {}
-        for r in ['front', 'rear', 'fl', 'fr', 'rl', 'rr']:
-            self.radar_pubs[r] = self.create_publisher(PointCloud2, f'/carla/radar/{r}', 10)
-
         # Connect to CARLA
         self.connect_to_carla()
 
-        self.heartbeat_sub = self.create_subscription(
-            Bool,
-            '/perception/heartbeat',
-            self.perception_heartbeat_callback,
-            10
-        )
-
-        self.last_tick_time = time.time()
-        self.waiting_for_perception = False
-
-        # Dedicated 20Hz control timer for physics and autopilot
-        self.control_timer = self.create_timer(0.05, self.control_tick, callback_group=self.control_group)
-        self.sensor_timer = self.create_timer(0.01, self.tick_and_publish)
+        # SINGLE clean timer to drive the simulation at exactly 20Hz (0.05s)
+        self.tick_timer = self.create_timer(0.05, self.world_tick)
 
     def connect_to_carla(self):
         self.get_logger().info("Connecting to CARLA on 127.0.0.1:2000...")
         self.client = carla.Client('127.0.0.1', 2000)
-        self.client.set_timeout(80.0)
+        self.client.set_timeout(10.0)
         
         self.world = self.client.get_world()
         if self.world.get_map().name.split('/')[-1] != 'Town01':
             self.world = self.client.load_world('Town01')
             
+        # PROPER SYNCHRONOUS SETUP
         settings = self.world.get_settings()
-        settings.synchronous_mode = False
-
-        # 0.05s fixed delta = 20Hz Simulation Rate
-        settings.fixed_delta_seconds = 0.05
+        settings.synchronous_mode = True
+        settings.fixed_delta_seconds = 0.05  # 20 Hz
         settings.substepping = True
         settings.max_substep_delta_time = 0.01
-        settings.max_substeps = 5  # 0.01 * 5 = 0.05 (Matches fixed_delta_seconds exactly!)
-
+        settings.max_substeps = 5
         self.world.apply_settings(settings)
         
+        # FORCE AUTOPILOT TO SYNC WITH PHYSICS
         traffic_manager = self.client.get_trafficmanager(8000)
         traffic_manager.set_synchronous_mode(True)
+        traffic_manager.set_global_distance_to_leading_vehicle(3.0)
         self.tm = traffic_manager
 
         self.spawn_ego_and_sensors()
@@ -219,15 +190,18 @@ class CarlaNode(Node):
         self.ego_vehicle.set_autopilot(True, self.tm.get_port())
         self.get_logger().info("Ego vehicle spawned and autopilot engaged.")
 
-        # Total expected sensors: cameras + 2 IMU + 2 GNSS + 1 LiDAR + 6 Radars
-        sensor_types = ['image', 'depth', 'seg'] if self.debug else ['image']
-        self.expected_sensor_frames = (len(CAMS) * len(sensor_types)) + 2 + 2 + 1 + 6
+        # Expected sensors: 2 IMU, 2 GNSS, and front_left camera
+        sensor_types = ['image']
+        self.expected_sensor_frames = 2 + 2 + 1
         self.get_logger().info(f"Expecting {self.expected_sensor_frames} CARLA sensor streams per tick.")
 
         # ==========================================
         # CAMERAS
         # ==========================================
+        # Only front_left camera is enabled here; CARLA synchronous mode drives frames.
         for name, ext in CAMS.items():
+            if name != 'front_left':
+                continue
             tf = carla.Transform(
                 carla.Location(x=ext['x'], y=ext['y'], z=ext['z']), 
                 carla.Rotation(pitch=ext['pitch'], yaw=ext['yaw'], roll=ext['roll'])
@@ -237,7 +211,8 @@ class CarlaNode(Node):
                 blueprint.set_attribute('image_size_x', str(ext['w']))
                 blueprint.set_attribute('image_size_y', str(ext['h']))
                 blueprint.set_attribute('fov', str(ext['fov']))
-                blueprint.set_attribute('sensor_tick', '1.0') # FORCED 1Hz
+                # CARLA sync mode controls timing, no explicit sensor_tick required.
+                # blueprint.set_attribute('sensor_tick', '1.0')
 
                 cam = self.world.spawn_actor(blueprint, tf, attach_to=self.ego_vehicle)
                 cam.listen(self.make_sensor_callback(name, sensor_type))
@@ -247,7 +222,9 @@ class CarlaNode(Node):
         # IMU (Primary & Backup)
         # ==========================================
         imu_bp = bp_lib.find('sensor.other.imu')
-        imu_bp.set_attribute('sensor_tick', '1.0') # FORCED 1Hz
+        # NOTE: CARLA synchronous mode and world.tick() drive all sensor updates.
+        # sensor_tick is not needed here and can conflict with fixed_delta_seconds.
+        # imu_bp.set_attribute('sensor_tick', '1.0') # FORCED 1Hz
         center_tf = carla.Transform(carla.Location(x=0, z=0))
         
         for name in ['primary', 'backup']:
@@ -259,7 +236,9 @@ class CarlaNode(Node):
         # GNSS (Front & Rear)
         # ==========================================
         gnss_bp = bp_lib.find('sensor.other.gnss')
-        gnss_bp.set_attribute('sensor_tick', '1.0') # FORCED 1Hz
+        # NOTE: CARLA synchronous mode and world.tick() drive all sensor updates.
+        # sensor_tick is not needed here and can conflict with fixed_delta_seconds.
+        # gnss_bp.set_attribute('sensor_tick', '1.0') # FORCED 1Hz
         
         gnss_f = self.world.spawn_actor(gnss_bp, carla.Transform(carla.Location(x=1.0, z=1.5)), attach_to=self.ego_vehicle)
         gnss_f.listen(self.make_sensor_callback('front', 'gnss'))
@@ -272,166 +251,117 @@ class CarlaNode(Node):
         # ==========================================
         # LIDAR
         # ==========================================
-        lidar_bp = bp_lib.find('sensor.lidar.ray_cast')
-        lidar_bp.set_attribute('channels', '32')
-        lidar_bp.set_attribute('range', '100')
-        lidar_bp.set_attribute('rotation_frequency', '1') # Matched to 1Hz world tick
-        lidar_bp.set_attribute('points_per_second', '500000')
-        lidar_bp.set_attribute('sensor_tick', '1.0') # FORCED 1Hz
+        # LIDAR disabled:
+        # lidar_bp = bp_lib.find('sensor.lidar.ray_cast')
+        # lidar_bp.set_attribute('channels', '32')
+        # lidar_bp.set_attribute('range', '100')
+        # lidar_bp.set_attribute('rotation_frequency', '1') # Matched to 1Hz world tick
+        # lidar_bp.set_attribute('points_per_second', '500000')
+        # lidar_bp.set_attribute('sensor_tick', '1.0') # FORCED 1Hz
 
-        lidar = self.world.spawn_actor(lidar_bp, carla.Transform(carla.Location(x=0.0, y=0.0, z=1.8)), attach_to=self.ego_vehicle)
-        lidar.listen(self.make_sensor_callback('top', 'lidar'))
-        self.actor_list.append(lidar)
+        # lidar = self.world.spawn_actor(lidar_bp, carla.Transform(carla.Location(x=0.0, y=0.0, z=1.8)), attach_to=self.ego_vehicle)
+        # lidar.listen(self.make_sensor_callback('top', 'lidar'))
+        # self.actor_list.append(lidar)
 
         # ==========================================
         # RADARS
         # ==========================================
-        def spawn_radar(name, x, y, z, yaw, h_fov, v_fov, rng):
-            bp = bp_lib.find('sensor.other.radar')
-            bp.set_attribute('horizontal_fov', str(h_fov))
-            bp.set_attribute('vertical_fov', str(v_fov))
-            bp.set_attribute('range', str(rng))
-            bp.set_attribute('sensor_tick', '1.0') # FORCED 1Hz
-            
-            tf = carla.Transform(carla.Location(x=x, y=y, z=z), carla.Rotation(yaw=yaw))
-            radar = self.world.spawn_actor(bp, tf, attach_to=self.ego_vehicle)
-            radar.listen(self.make_sensor_callback(name, 'radar'))
-            self.actor_list.append(radar)
+        # Radar sensors disabled:
+        # def spawn_radar(name, x, y, z, yaw, h_fov, v_fov, rng):
+        #     bp = bp_lib.find('sensor.other.radar')
+        #     bp.set_attribute('horizontal_fov', str(h_fov))
+        #     bp.set_attribute('vertical_fov', str(v_fov))
+        #     bp.set_attribute('range', str(rng))
+        #     bp.set_attribute('sensor_tick', '1.0') # FORCED 1Hz
+        #     
+        #     tf = carla.Transform(carla.Location(x=x, y=y, z=z), carla.Rotation(yaw=yaw))
+        #     radar = self.world.spawn_actor(bp, tf, attach_to=self.ego_vehicle)
+        #     radar.listen(self.make_sensor_callback(name, 'radar'))
+        #     self.actor_list.append(radar)
 
-        spawn_radar('front',  2.0,  0.0, 0.5, 0,   30, 15, 100)
-        spawn_radar('rear',  -2.0,  0.0, 0.5, 180, 30, 15, 100)
-        spawn_radar('fl',     1.8, -0.8, 0.5, -45,  90, 30, 30)
-        spawn_radar('fr',     1.8,  0.8, 0.5, 45,   90, 30, 30)
-        spawn_radar('rl',    -1.8, -0.8, 0.5, -135, 90, 30, 30)
-        spawn_radar('rr',    -1.8,  0.8, 0.5, 135,  90, 30, 30)
+        # spawn_radar('front',  2.0,  0.0, 0.5, 0,   30, 15, 100)
+        # spawn_radar('rear',  -2.0,  0.0, 0.5, 180, 30, 15, 100)
+        # spawn_radar('fl',     1.8, -0.8, 0.5, -45,  90, 30, 30)
+        # spawn_radar('fr',     1.8,  0.8, 0.5, 45,   90, 30, 30)
+        # spawn_radar('rl',    -1.8, -0.8, 0.5, -135, 90, 30, 30)
+        # spawn_radar('rr',    -1.8,  0.8, 0.5, 135,  90, 30, 30)
 
         self.get_logger().info("All V6 sensors spawned successfully at 1Hz.")
 
-    def control_tick(self):
-        if self.waiting_for_perception:
-            if time.time() - self.last_tick_time > 5.0:
-                self.get_logger().warn("Perception timeout! Forcing a tick to prevent deadlock.")
-                self.waiting_for_perception = False
-            else:
-                return
-
-        stamp = self.get_clock().now().to_msg()
-        try:
-            self.world.tick()
-            self.update_spectator_camera()
-            self.publish_gt_odometry(stamp)
-        except Exception as e:
-            self.get_logger().error(f"CARLA control tick failed: {e}")
+    def world_tick(self):
+        if not self.running:
             return
+        
+        try:
+            # 1. Step the physics engine & autopilot
+            self.world.tick()
+            
+            # 2. Update Ground Truth & Camera
+            if self.ego_vehicle is not None and self.ego_vehicle.is_alive:
+                self.update_spectator_camera()
+                stamp = self.get_clock().now().to_msg()
+                self.publish_gt_odometry(stamp)
 
-        self.tick_counter += 1
-        self.last_tick_time = time.time()
-        self.waiting_for_perception = True
-
-    def perception_heartbeat_callback(self, msg):
-        if msg.data:
-            self.waiting_for_perception = False
-
-    def tick_and_publish(self):
-        stamp = self.get_clock().now().to_msg()
-        expected = getattr(self, 'expected_sensor_frames', 0)
-        gathered = 0
-        timeout_start = time.time()
-
-        while gathered < expected and (time.time() - timeout_start) < 10.0:
-            try:
-                name, sensor_type, data = self.sensor_queue.get(timeout=0.1)
-
-                # Process Vision Sensors
-                if sensor_type in ['image', 'depth', 'seg']:
-                    bgra = np.frombuffer(data.raw_data, dtype=np.uint8).reshape(data.height, data.width, 4)
-                    if sensor_type == 'image':
-                        msg = self.bridge.cv2_to_imgmsg(bgra[:, :, :3], encoding='bgr8')
-                        compressed_msg = self.bridge.cv2_to_compressed_imgmsg(bgra[:, :, :3], dst_format='jpeg')
-                        compressed_msg.header.stamp = stamp
-                        compressed_msg.header.frame_id = name
-                        self.publishers_dict[name]['image_compressed'].publish(compressed_msg)
-                    else:
-                        msg = self.bridge.cv2_to_imgmsg(bgra, encoding='bgra8')
-                    msg.header.stamp = stamp
-                    msg.header.frame_id = name
-                    self.publishers_dict[name][sensor_type].publish(msg)
-
-                # Process IMU
-                elif sensor_type == 'imu':
-                    msg = Imu()
-                    msg.header.stamp = stamp
-                    msg.header.frame_id = f"imu_{name}"
-                    msg.linear_acceleration.x = data.accelerometer.x
-                    msg.linear_acceleration.y = data.accelerometer.y
-                    msg.linear_acceleration.z = data.accelerometer.z
-                    msg.angular_velocity.x = data.gyroscope.x
-                    msg.angular_velocity.y = data.gyroscope.y
-                    msg.angular_velocity.z = data.gyroscope.z
-                    self.imu_pubs[name].publish(msg)
-
-                # Process GNSS
-                elif sensor_type == 'gnss':
-                    msg = NavSatFix()
-                    msg.header.stamp = stamp
-                    msg.header.frame_id = f"gnss_{name}"
-                    msg.latitude = data.latitude
-                    msg.longitude = data.longitude
-                    msg.altitude = data.altitude
-                    self.gnss_pubs[name].publish(msg)
-
-                # Process LiDAR
-                elif sensor_type == 'lidar':
-                    points = np.frombuffer(data.raw_data, dtype=np.float32)
-                    points = np.reshape(points, (int(points.shape[0] / 4), 4))
-                    fields = [
-                        PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
-                        PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
-                        PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
-                        PointField(name='intensity', offset=12, datatype=PointField.FLOAT32, count=1),
-                    ]
-                    msg = pc2.create_cloud(Header(frame_id=f'lidar_{name}', stamp=stamp), fields, points)
-                    self.lidar_pub.publish(msg)
-
-                # Process Radar (Converted to PointCloud2 for easy handling in ROS)
-                elif sensor_type == 'radar':
-                    points = np.frombuffer(data.raw_data, dtype=np.float32)
-                    points = np.reshape(points, (int(points.shape[0] / 4), 4))
+            # 3. Drain the sensor queue for this frame
+            expected = getattr(self, 'expected_sensor_frames', 0)
+            gathered = 0
+            
+            while gathered < expected:
+                try:
+                    name, sensor_type, data = self.sensor_queue.get(timeout=1.0)
                     
-                    # Convert radar Depth, Azimuth, Altitude to XYZ
-                    depth, azimuth, alt, vel = points[:, 0], points[:, 1], points[:, 2], points[:, 3]
-                    x = depth * np.cos(alt) * np.cos(azimuth)
-                    y = depth * np.cos(alt) * np.sin(azimuth)
-                    z = depth * np.sin(alt)
-                    
-                    radar_points = np.column_stack((x, y, z, vel))
-                    fields = [
-                        PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
-                        PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
-                        PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
-                        PointField(name='velocity', offset=12, datatype=PointField.FLOAT32, count=1),
-                    ]
-                    msg = pc2.create_cloud(Header(frame_id=f'radar_{name}', stamp=stamp), fields, radar_points)
-                    self.radar_pubs[name].publish(msg)
+                    if sensor_type == 'imu':
+                        msg = Imu()
+                        msg.header.stamp = stamp
+                        msg.header.frame_id = f"imu_{name}"
+                        msg.linear_acceleration.x = data.accelerometer.x
+                        msg.linear_acceleration.y = data.accelerometer.y
+                        msg.linear_acceleration.z = data.accelerometer.z
+                        msg.angular_velocity.x = data.gyroscope.x
+                        msg.angular_velocity.y = data.gyroscope.y
+                        msg.angular_velocity.z = data.gyroscope.z
+                        self.imu_pubs[name].publish(msg)
 
-                gathered += 1
-            except queue.Empty:
-                continue
-            except Exception as e:
-                self.get_logger().error(f"Failed to publish CARLA {sensor_type} frame: {e}")
-                continue
+                    elif sensor_type == 'gnss':
+                        msg = NavSatFix()
+                        msg.header.stamp = stamp
+                        msg.header.frame_id = f"gnss_{name}"
+                        msg.latitude = data.latitude
+                        msg.longitude = data.longitude
+                        msg.altitude = data.altitude
+                        self.gnss_pubs[name].publish(msg)
 
-        if gathered == 0:
-            self.get_logger().warn(
-                f"CARLA tick produced no sensor frames after {time.time() - timeout_start:.2f}s; queue size={self.sensor_queue.qsize()}"
-            )
-        elif self.debug and gathered < expected:
-            self.get_logger().warn(
-                f"CARLA tick produced partial data {gathered}/{expected}; queue size={self.sensor_queue.qsize()}"
-            )
+                    elif sensor_type == 'image':
+                        msg = Image()
+                        msg.header.stamp = stamp
+                        msg.header.frame_id = 'front_left'
+                        msg.height = data.height
+                        msg.width = data.width
+                        msg.encoding = 'bgra8'
+                        msg.is_bigendian = 0
+                        msg.step = data.width * 4
+                        msg.data = data.raw_data
+                        self.camera_pubs[name].publish(msg)
+
+                    gathered += 1
+                except queue.Empty:
+                    self.get_logger().warn(f"Sensor queue timeout! Gathered {gathered}/{expected}")
+                    break
+
+        except Exception as e:
+            self.get_logger().error(f"CARLA world tick failed: {e}")
 
     def destroy_node(self):
         self.get_logger().info("Shutting down CARLA node and cleaning up actors...")
+        self.running = False
+        try:
+            self.control_timer.cancel()
+        except Exception:
+            pass
+        try:
+            self.sensor_timer.cancel()
+        except Exception:
+            pass
         for actor in list(self.actor_list):
             try:
                 if actor.is_alive:
