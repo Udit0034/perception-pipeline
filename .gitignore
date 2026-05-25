@@ -1,0 +1,44 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Virtual environments
+venv/
+.env
+.venv/
+
+# IDE/editor settings
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# Logs and runtime files
+*.log
+*.out
+*.tmp
+*.temp
+*~
+
+# Carla / model build artifacts
+*.onnx
+*.engine
+trt_engine_cache/
+
+# Media and temporary output files
+*.avi
+*.mp4
+*.mov
+*.mkv
+output*.txt
+
+# Build and packaging
+build/
+dist/
+pip-wheel-metadata/
+*.egg-info/
+
+# Misc
+.DS_Store
