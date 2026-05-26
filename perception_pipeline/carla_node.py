@@ -7,6 +7,8 @@ from sensor_msgs.msg import CompressedImage, Image, Imu, NavSatFix, PointCloud2,
 from nav_msgs.msg import Odometry
 import sensor_msgs_py.point_cloud2 as pc2
 from cv_bridge import CvBridge
+import random
+from geometry_msgs.msg import PointStamped
 
 import carla
 import numpy as np
@@ -41,7 +43,7 @@ class CarlaNode(Node):
 
         self.bridge = CvBridge()
         self.sensor_queue = queue.Queue()
-        self.sensor_callback_count = 0  # <--- ADD THIS LINE
+        self.sensor_callback_count = 0 
         self.actor_list = []
         self.running = True
 
@@ -58,7 +60,8 @@ class CarlaNode(Node):
             'front_left': self.create_publisher(Image, '/carla/front_left/image_raw', 10)
         }
         self.gt_odom_pub = self.create_publisher(Odometry, '/carla/ego_vehicle/odometry', 10)
-        
+        self.altimeter_pub = self.create_publisher(PointStamped, '/carla/altimeter', 10)
+        self.wheel_odom_pub = self.create_publisher(Odometry, '/carla/ego_vehicle/wheel_odom', 10)
         # Connect to CARLA
         self.connect_to_carla()
 
@@ -141,6 +144,25 @@ class CarlaNode(Node):
 
         self.gt_odom_pub.publish(odom_msg)
 
+        # --- PROXY ALTIMETER ---
+        gt_z_noisy = transform.location.z + random.gauss(0.0, 0.3)
+        alt_msg = PointStamped()
+        alt_msg.header.stamp = stamp
+        alt_msg.header.frame_id = 'odom'
+        alt_msg.point.z = gt_z_noisy
+        self.altimeter_pub.publish(alt_msg)
+
+        # --- PROXY WHEEL ODOMETRY ---
+        gt_speed = math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
+        # 2% wheel slip + noise
+        odom_speed = gt_speed * 1.02 + random.gauss(0.0, 0.1) 
+        
+        wheel_msg = Odometry()
+        wheel_msg.header.stamp = stamp
+        wheel_msg.header.frame_id = 'base_link'
+        wheel_msg.twist.twist.linear.x = odom_speed
+        self.wheel_odom_pub.publish(wheel_msg)
+
     def make_sensor_callback(self, name, sensor_type):
         def callback(data):
             self._sensor_callback(name, sensor_type, data)
@@ -190,41 +212,37 @@ class CarlaNode(Node):
         self.ego_vehicle.set_autopilot(True, self.tm.get_port())
         self.get_logger().info("Ego vehicle spawned and autopilot engaged.")
 
-        # Expected sensors: 2 IMU, 2 GNSS, and front_left camera
-        sensor_types = ['image']
-        self.expected_sensor_frames = 2 + 2 + 1
+        # ==========================================
+        # PHASE 1 SENSOR SETUP (IMU & GNSS ONLY)
+        # ==========================================
+        # Expected sensors: 2 IMU, 2 GNSS
+        self.expected_sensor_frames = 2 + 2 
         self.get_logger().info(f"Expecting {self.expected_sensor_frames} CARLA sensor streams per tick.")
 
         # ==========================================
-        # CAMERAS
+        # CAMERAS (DISABLED FOR PHASE 1)
         # ==========================================
-        # Only front_left camera is enabled here; CARLA synchronous mode drives frames.
-        for name, ext in CAMS.items():
-            if name != 'front_left':
-                continue
-            tf = carla.Transform(
-                carla.Location(x=ext['x'], y=ext['y'], z=ext['z']), 
-                carla.Rotation(pitch=ext['pitch'], yaw=ext['yaw'], roll=ext['roll'])
-            )
-            for sensor_type in sensor_types:
-                blueprint = bp_lib.find(SENSOR_BLUEPRINTS[sensor_type]['type'])
-                blueprint.set_attribute('image_size_x', str(ext['w']))
-                blueprint.set_attribute('image_size_y', str(ext['h']))
-                blueprint.set_attribute('fov', str(ext['fov']))
-                # CARLA sync mode controls timing, no explicit sensor_tick required.
-                # blueprint.set_attribute('sensor_tick', '1.0')
-
-                cam = self.world.spawn_actor(blueprint, tf, attach_to=self.ego_vehicle)
-                cam.listen(self.make_sensor_callback(name, sensor_type))
-                self.actor_list.append(cam)
+        # sensor_types = ['image']
+        # for name, ext in CAMS.items():
+        #     if name != 'front_left':
+        #         continue
+        #     tf = carla.Transform(
+        #         carla.Location(x=ext['x'], y=ext['y'], z=ext['z']), 
+        #         carla.Rotation(pitch=ext['pitch'], yaw=ext['yaw'], roll=ext['roll'])
+        #     )
+        #     for sensor_type in sensor_types:
+        #         blueprint = bp_lib.find(SENSOR_BLUEPRINTS[sensor_type]['type'])
+        #         blueprint.set_attribute('image_size_x', str(ext['w']))
+        #         blueprint.set_attribute('image_size_y', str(ext['h']))
+        #         blueprint.set_attribute('fov', str(ext['fov']))
+        #         cam = self.world.spawn_actor(blueprint, tf, attach_to=self.ego_vehicle)
+        #         cam.listen(self.make_sensor_callback(name, sensor_type))
+        #         self.actor_list.append(cam)
 
         # ==========================================
         # IMU (Primary & Backup)
         # ==========================================
         imu_bp = bp_lib.find('sensor.other.imu')
-        # NOTE: CARLA synchronous mode and world.tick() drive all sensor updates.
-        # sensor_tick is not needed here and can conflict with fixed_delta_seconds.
-        # imu_bp.set_attribute('sensor_tick', '1.0') # FORCED 1Hz
         center_tf = carla.Transform(carla.Location(x=0, z=0))
         
         for name in ['primary', 'backup']:
@@ -236,9 +254,6 @@ class CarlaNode(Node):
         # GNSS (Front & Rear)
         # ==========================================
         gnss_bp = bp_lib.find('sensor.other.gnss')
-        # NOTE: CARLA synchronous mode and world.tick() drive all sensor updates.
-        # sensor_tick is not needed here and can conflict with fixed_delta_seconds.
-        # gnss_bp.set_attribute('sensor_tick', '1.0') # FORCED 1Hz
         
         gnss_f = self.world.spawn_actor(gnss_bp, carla.Transform(carla.Location(x=1.0, z=1.5)), attach_to=self.ego_vehicle)
         gnss_f.listen(self.make_sensor_callback('front', 'gnss'))
@@ -249,9 +264,8 @@ class CarlaNode(Node):
         self.actor_list.append(gnss_r)
 
         # ==========================================
-        # LIDAR
+        # LIDAR (DISABLED)
         # ==========================================
-        # LIDAR disabled:
         # lidar_bp = bp_lib.find('sensor.lidar.ray_cast')
         # lidar_bp.set_attribute('channels', '32')
         # lidar_bp.set_attribute('range', '100')
@@ -264,9 +278,8 @@ class CarlaNode(Node):
         # self.actor_list.append(lidar)
 
         # ==========================================
-        # RADARS
+        # RADARS (DISABLED)
         # ==========================================
-        # Radar sensors disabled:
         # def spawn_radar(name, x, y, z, yaw, h_fov, v_fov, rng):
         #     bp = bp_lib.find('sensor.other.radar')
         #     bp.set_attribute('horizontal_fov', str(h_fov))
@@ -286,7 +299,7 @@ class CarlaNode(Node):
         # spawn_radar('rl',    -1.8, -0.8, 0.5, -135, 90, 30, 30)
         # spawn_radar('rr',    -1.8,  0.8, 0.5, 135,  90, 30, 30)
 
-        self.get_logger().info("All V6 sensors spawned successfully at 1Hz.")
+        self.get_logger().info("All Phase 1 sensors spawned successfully (Cameras disabled).")
 
     def world_tick(self):
         if not self.running:

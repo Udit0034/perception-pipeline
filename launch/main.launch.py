@@ -7,7 +7,7 @@ from launch.conditions import IfCondition
 from launch_ros.actions import Node
 
 def generate_launch_description():
-    # 1. Declare the 'debug' and 'with_rviz' global arguments
+    # 1. Declare the global arguments
     debug_arg = DeclareLaunchArgument(
         'debug',
         default_value='false',
@@ -24,10 +24,6 @@ def generate_launch_description():
     with_rviz = LaunchConfiguration('with_rviz')
 
     # 3. Define the Nodes
-
-    # 3. Define the Nodes
-    
-    # Carla Node: Always runs. (You'll update it to check 'debug' and spawn 5 or 15 cameras)
     carla_node = Node(
         package='perception_pipeline',
         executable='carla_node',
@@ -36,16 +32,13 @@ def generate_launch_description():
         parameters=[{'debug': debug_config}]
     )
 
-    # Inference Node: Always runs. Consumes RGB and outputs Pred Depth/Seg.
     inference_node = Node(
         package='perception_pipeline',
         executable='infrence_node',
         name='inference_node',
         output='screen'
-        # Doesn't strictly need debug unless you want to silence its prints
     )
 
-    # Evaluate Node: Always launch, but its behavior changes with debug mode
     evaluate_node = Node(
         package='perception_pipeline',
         executable='evaluate_node',
@@ -54,7 +47,6 @@ def generate_launch_description():
         parameters=[{'debug': debug_config}],
     )
 
-    # Dashboard Node: Always runs, but adapts RViz outputs based on debug
     dashboard_node = Node(
         package='perception_pipeline',
         executable='dashboard_node',
@@ -75,9 +67,10 @@ def generate_launch_description():
         executable='visual_odometry_node',
         name='visual_odometry_node',
         output='screen',
-        condition=IfCondition(debug_config)
+        condition=IfCondition(debug_config) 
     )
 
+    # --- RViz Configuration Logic ---
     eval_debug_rviz = os.path.join(
         get_package_share_directory('perception_pipeline'),
         'rviz',
@@ -89,25 +82,20 @@ def generate_launch_description():
         'eval_inference.rviz'
     )
 
+    # Keep PythonExpression here to select the correct file path based on debug mode
     rviz_config_file = PythonExpression([
         "'", debug_config, "' == 'true' and '", eval_debug_rviz, "' or '", eval_inference_rviz, "'"
     ])
 
-    rviz_enabled = PythonExpression([
-        "'", debug_config, "' == 'true' or '", with_rviz, "' == 'true'"
-    ])
-
+    # FIXED: Strictly enforce the 'with_rviz' argument. 
     rviz_node = Node(
         package='rviz2',
         executable='rviz2',
         name='dashboard_rviz',
         output='screen',
         arguments=['-d', rviz_config_file],
-        condition=IfCondition(rviz_enabled)
+        condition=IfCondition(with_rviz)
     )
-
-    # Note: EngineBuilderNode is usually run once offline to build the cache, 
-    # so we don't put it in the real-time launch file.
 
     # 4. Return the LaunchDescription
     return LaunchDescription([

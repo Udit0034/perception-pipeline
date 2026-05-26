@@ -2,11 +2,13 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Imu, NavSatFix
 from nav_msgs.msg import Odometry
+from geometry_msgs.msg import PointStamped
+import message_filters
 import numpy as np
 import math
 
 # ==========================================
-# MATH UTILITIES (From your script)
+# MATH UTILITIES
 # ==========================================
 def wrap_angle(angle: float) -> float:
     return (angle + np.pi) % (2.0 * np.pi) - np.pi
@@ -27,9 +29,6 @@ def quaternion_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
         w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
         w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
     ])
-
-def normalize_angle(angle):
-    return (angle + np.pi) % (2 * np.pi) - np.pi
 
 def small_angle_quaternion(delta_theta: np.ndarray) -> np.ndarray:
     d = np.asarray(delta_theta, dtype=float).reshape(3)
@@ -77,7 +76,7 @@ def quaternion_to_yaw(q: np.ndarray) -> float:
 
 
 # ==========================================
-# EKF CLASS (From your script)
+# EKF CLASS
 # ==========================================
 class ESEKF12:
     IX, IY, IZ = 0, 1, 2
@@ -102,12 +101,16 @@ class ESEKF12:
 
         self.R_gnss = np.diag([0.029675973485482014, 0.28730269734687247, 1.4238959381497729])
         self.R_vel_3d = np.diag([0.04239846648067301, 1.0, 0.00029661512082430056])
-        self.R_altimeter = np.array([[0.0031314665810012196]])
         self.R_compass = np.array([[0.049387892829388665]])
-        self.R_gnss_yaw = np.array([[0.049387892829388665]])
+        self.R_gnss_yaw = np.array([[0.049387892829388665]]) 
+        self.R_dual_gnss_yaw = np.array([[0.05]])          
         self.R_pitch_roll = np.diag([0.0001, 0.20660105101293294])
         self.R_vo_pos = np.diag([1.0568245483161656, 0.2960289179277321, 0.15765852629457774])
         self.R_vo_orient = np.diag([0.1646091287778927, 0.7567409919301394, 3.1622776601683795])
+        
+        # New Covariances for Proxy Sensors
+        self.R_altimeter = np.array([[0.09]]) # 0.3^2
+        self.R_wheel_odom = np.array([[0.01]]) # 0.1^2
 
         self._initialized = False
 
@@ -197,8 +200,7 @@ class ESEKF12:
     def update_compass_yaw(self, meas_yaw):
         if not self._initialized: return
         yaw, _, _ = self.get_euler()
-        wrapped_diff = (meas_yaw - yaw + np.pi) % (2 * np.pi) - np.pi
-        residual = np.array([[wrapped_diff]])
+        residual = np.array([[wrap_angle(meas_yaw - yaw)]])
         H = np.zeros((1, self.ERROR_DIM))
         H[0, 5] = 1.0
         self._error_update(residual, H, self.R_compass, angle_rows=(0,))
@@ -206,10 +208,18 @@ class ESEKF12:
     def update_gnss_yaw(self, meas_yaw):
         if not self._initialized: return
         yaw, _, _ = self.get_euler()
-        residual = np.array([[meas_yaw - yaw]])
+        residual = np.array([[wrap_angle(meas_yaw - yaw)]])
         H = np.zeros((1, self.ERROR_DIM))
         H[0, 5] = 1.0
         self._error_update(residual, H, self.R_gnss_yaw, angle_rows=(0,))
+
+    def update_dual_gnss_yaw(self, meas_yaw):
+        if not self._initialized: return
+        yaw, _, _ = self.get_euler()
+        residual = np.array([[wrap_angle(meas_yaw - yaw)]])
+        H = np.zeros((1, self.ERROR_DIM))
+        H[0, 5] = 1.0
+        self._error_update(residual, H, self.R_dual_gnss_yaw, angle_rows=(0,))
 
     def update_pitch_roll_from_accel(self, meas_pitch, meas_roll, accel_magnitude):
         if not self._initialized: return
@@ -223,27 +233,28 @@ class ESEKF12:
         H[1, 3] = 1.0 
         self._error_update(residual, H, self.R_pitch_roll, angle_rows=(0, 1))
 
-    def update_vo(self, meas_x, meas_y, meas_z, meas_yaw, meas_pitch, meas_roll):
+    # --- New Proxy Updates ---
+    def update_altimeter(self, meas_z):
         if not self._initialized: return
-        z_pos = np.array([[meas_x], [meas_y], [meas_z]])
-        p = self.x[self.IX:self.IZ + 1, :]
-        residual_pos = z_pos - p
-        H_pos = np.zeros((3, self.ERROR_DIM))
-        H_pos[0:3, 0:3] = np.eye(3)
-        self._error_update(residual_pos, H_pos, self.R_vo_pos)
+        residual = np.array([[meas_z - self.x[self.IZ, 0]]])
+        H = np.zeros((1, self.ERROR_DIM))
+        H[0, 2] = 1.0 # 2 is index for IZ in error state (dx, dy, dz)
+        self._error_update(residual, H, self.R_altimeter)
+
+    def update_wheel_odom(self, meas_speed):
+        if not self._initialized: return
+        yaw = quaternion_to_yaw(self.get_quaternion())
+        v_x = self.x[self.IVX, 0]
+        v_y = self.x[self.IVY, 0]
         
-        _, est_pitch, est_roll = self.get_euler()
-        est_yaw = quaternion_to_yaw(self.get_quaternion())
+        # Project world velocity to body forward axis
+        v_forward_est = v_x * np.cos(yaw) + v_y * np.sin(yaw)
+        residual = np.array([[meas_speed - v_forward_est]])
         
-        z_orient = np.array([[meas_pitch], [meas_roll], [meas_yaw]])
-        h_orient = np.array([[est_pitch], [est_roll], [est_yaw]])
-        residual_orient = z_orient - h_orient
-        
-        H_orient = np.zeros((3, self.ERROR_DIM))
-        H_orient[0, 4] = 1.0
-        H_orient[1, 3] = 1.0
-        H_orient[2, 5] = 1.0
-        self._error_update(residual_orient, H_orient, self.R_vo_orient, angle_rows=(0, 1, 2))
+        H = np.zeros((1, self.ERROR_DIM))
+        H[0, 6] = np.cos(yaw) # 6 is dvx in error state
+        H[0, 7] = np.sin(yaw) # 7 is dvy in error state
+        self._error_update(residual, H, self.R_wheel_odom)
 
 
 # ==========================================
@@ -257,7 +268,7 @@ class EKFFusionNode(Node):
 
         # Timing and state tracking
         self.last_time = None
-        self.gnss_origin = None  # (lat, lon, alt) for converting to local X/Y/Z
+        self.gnss_origin = None  
         self.prev_gnss_x = None
         self.prev_gnss_y = None
         self.prev_gnss_time = None
@@ -267,8 +278,20 @@ class EKFFusionNode(Node):
 
         # Subscribers
         self.imu_sub = self.create_subscription(Imu, '/carla/imu/primary', self.imu_callback, 10)
-        self.gnss_sub = self.create_subscription(NavSatFix, '/carla/gnss/front', self.gnss_callback, 10)
         self.vo_sub = self.create_subscription(Odometry, '/vo/odometry', self.vo_callback, 10)
+        
+        # Proxy Subscribers
+        self.altimeter_sub = self.create_subscription(PointStamped, '/carla/altimeter', self.altimeter_callback, 10)
+        self.wheel_odom_sub = self.create_subscription(Odometry, '/carla/ego_vehicle/wheel_odom', self.wheel_odom_callback, 10)
+
+        # Dual-GNSS Synchronization
+        self.gnss_front_sub = message_filters.Subscriber(self, NavSatFix, '/carla/gnss/front')
+        self.gnss_rear_sub = message_filters.Subscriber(self, NavSatFix, '/carla/gnss/rear')
+        
+        self.gnss_sync = message_filters.ApproximateTimeSynchronizer(
+            [self.gnss_front_sub, self.gnss_rear_sub], queue_size=10, slop=0.05
+        )
+        self.gnss_sync.registerCallback(self.dual_gnss_callback)
 
         self.get_logger().info("EKF Fusion Node Started. Waiting for GNSS/IMU to initialize...")
 
@@ -276,13 +299,11 @@ class EKFFusionNode(Node):
         return stamp.sec + stamp.nanosec * 1e-9
 
     def latlon_to_xy(self, lat, lon):
-        """Basic flat-earth approximation from origin coordinate"""
         EARTH_RADIUS = 6378137.0
         if self.gnss_origin is None:
             return 0.0, 0.0
         lat0, lon0 = self.gnss_origin[0], self.gnss_origin[1]
         
-        # Convert to local Cartesian (approximate)
         dlat = math.radians(lat - lat0)
         dlon = math.radians(lon - lon0)
         
@@ -298,12 +319,14 @@ class EKFFusionNode(Node):
             return
             
         dt = current_time - self.last_time
+        
+        # ⬇️ FIXED: Bound dt to prevent physics explosions from ROS 2 startup lag
+        dt = max(0.01, min(dt, 0.1)) 
         self.last_time = current_time
 
         if not self.ekf._initialized:
             return
 
-        # Extract IMU data
         accel_x = msg.linear_acceleration.x
         accel_y = msg.linear_acceleration.y
         accel_z = msg.linear_acceleration.z
@@ -311,64 +334,94 @@ class EKFFusionNode(Node):
         gyro_y = msg.angular_velocity.y
         gyro_z = msg.angular_velocity.z
 
-        # EKF Prediction Step
         self.ekf.predict(dt, accel_x, -accel_y, gyro_x, gyro_y, gyro_z)
 
-        # Extract orientation if provided by the IMU simulator (Compass/Pitch/Roll)
         q = np.array([msg.orientation.w, msg.orientation.x, msg.orientation.y, msg.orientation.z])
         yaw, pitch, roll = quaternion_to_euler(q)
 
-        # EKF Updates from IMU
-        self.ekf.update_compass_yaw(yaw)
+        # Apply the 90 degree (pi/2) offset to fix the frame mismatch
+        compass_yaw = wrap_angle(yaw - (math.pi / 2))
+
+        self.ekf.update_compass_yaw(compass_yaw)
+        
         accel_mag = math.sqrt(accel_x**2 + accel_y**2 + accel_z**2)
         self.ekf.update_pitch_roll_from_accel(pitch, roll, accel_mag)
 
-        # Publish the new state
         self.publish_ekf_state(msg.header.stamp)
 
-    def gnss_callback(self, msg: NavSatFix):
-        current_time = self.get_time_sec(msg.header.stamp)
+    def dual_gnss_callback(self, front_msg: NavSatFix, rear_msg: NavSatFix):
+        current_time = self.get_time_sec(front_msg.header.stamp)
 
-        # Set origin if first message
+        # ⬇️ FIXED: Initialization block now correctly calculates true starting yaw
         if self.gnss_origin is None:
-            self.gnss_origin = (msg.latitude, msg.longitude, msg.altitude)
+            # Set the origin FIRST so latlon_to_xy works!
+            self.gnss_origin = (front_msg.latitude, front_msg.longitude, front_msg.altitude)
             
-            # Initialize the EKF on the first GNSS message
+            # Now calculate the real relative coordinates (front will be 0,0)
+            curr_front_x, curr_front_y = self.latlon_to_xy(front_msg.latitude, front_msg.longitude)
+            curr_rear_x, curr_rear_y = self.latlon_to_xy(rear_msg.latitude, rear_msg.longitude)
+            
+            # Calculate absolute yaw from dual antenna
+            dx = curr_front_x - curr_rear_x
+            dy = curr_front_y - curr_rear_y
+            dual_gnss_yaw = math.atan2(dy, dx)
+            
             if not self.ekf._initialized:
                 self.ekf.initialize_state(
                     x=0.0, y=0.0, z=0.0,
-                    vx=0.0, yaw=0.0, pitch=0.0, roll=0.0
+                    vx=0.0, yaw=dual_gnss_yaw, pitch=0.0, roll=0.0
                 )
-                self.get_logger().info("EKF Initialized at GNSS Origin.")
+                self.get_logger().info(f"EKF Initialized. TRUE Init Yaw: {math.degrees(dual_gnss_yaw):.2f}°")
+            
+            # Initialize timing tracking to avoid 2nd frame jumps
+            self.prev_gnss_time = current_time
+            self.prev_gnss_x = curr_front_x
+            self.prev_gnss_y = curr_front_y
             return
 
-        # Convert Lat/Lon to Local X/Y
-        curr_x, curr_y = self.latlon_to_xy(msg.latitude, msg.longitude)
-        curr_z = msg.altitude - self.gnss_origin[2]
+        # --- Subseqent Frame Processing ---
+        curr_front_x, curr_front_y = self.latlon_to_xy(front_msg.latitude, front_msg.longitude)
+        curr_rear_x, curr_rear_y = self.latlon_to_xy(rear_msg.latitude, rear_msg.longitude)
+        
+        curr_front_z = front_msg.altitude - self.gnss_origin[2]
 
-        self.ekf.update_gnss_3d(curr_x, curr_y, curr_z)
+        dx = curr_front_x - curr_rear_x
+        dy = curr_front_y - curr_rear_y
+        dual_gnss_yaw = math.atan2(dy, dx)
 
-        # Calculate COG (Course Over Ground)
+        # 1. Base 3D Position Update
+        self.ekf.update_gnss_3d(curr_front_x, curr_front_y, curr_front_z)
+
+        # 2. Single GNSS (COG) Update
         if self.prev_gnss_x is not None:
             gnss_dt = current_time - self.prev_gnss_time
             if gnss_dt > 0.0:
-                vx = (curr_x - self.prev_gnss_x) / gnss_dt
-                vy = (curr_y - self.prev_gnss_y) / gnss_dt
+                vx = (curr_front_x - self.prev_gnss_x) / gnss_dt
+                vy = (curr_front_y - self.prev_gnss_y) / gnss_dt
                 speed = math.sqrt(vx**2 + vy**2)
-                
                 if speed > 1.0:
                     gnss_yaw = math.atan2(vy, vx)
                     self.ekf.update_gnss_yaw(gnss_yaw)
 
-        self.prev_gnss_x = curr_x
-        self.prev_gnss_y = curr_y
+        # 3. Dual GNSS Absolute Heading Update
+        self.ekf.update_dual_gnss_yaw(dual_gnss_yaw)
+
+        self.prev_gnss_x = curr_front_x
+        self.prev_gnss_y = curr_front_y
         self.prev_gnss_time = current_time
+
+    def altimeter_callback(self, msg: PointStamped):
+        if not self.ekf._initialized: return
+        self.ekf.update_altimeter(msg.point.z)
+
+    def wheel_odom_callback(self, msg: Odometry):
+        if not self.ekf._initialized: return
+        self.ekf.update_wheel_odom(msg.twist.twist.linear.x)
 
     def vo_callback(self, msg: Odometry):
         if not self.ekf._initialized:
             return
 
-        # Extract VO Pose
         meas_x = msg.pose.pose.position.x
         meas_y = msg.pose.pose.position.y
         meas_z = msg.pose.pose.position.z
@@ -389,10 +442,14 @@ class EKFFusionNode(Node):
         odom_msg.header.frame_id = 'odom'
         odom_msg.child_frame_id = 'base_link'
 
-        # Set Position
+        # Set Position & Velocity
         odom_msg.pose.pose.position.x = float(self.ekf.x[self.ekf.IX, 0])
         odom_msg.pose.pose.position.y = float(self.ekf.x[self.ekf.IY, 0])
         odom_msg.pose.pose.position.z = float(self.ekf.x[self.ekf.IZ, 0])
+        
+        odom_msg.twist.twist.linear.x = float(self.ekf.x[self.ekf.IVX, 0])
+        odom_msg.twist.twist.linear.y = float(self.ekf.x[self.ekf.IVY, 0])
+        odom_msg.twist.twist.linear.z = float(self.ekf.x[self.ekf.IVZ, 0])
 
         # Set Orientation
         q = self.ekf.get_quaternion()
@@ -401,10 +458,10 @@ class EKFFusionNode(Node):
         odom_msg.pose.pose.orientation.y = float(q[2])
         odom_msg.pose.pose.orientation.z = float(q[3])
 
-        # Set Velocity
-        odom_msg.twist.twist.linear.x = float(self.ekf.x[self.ekf.IVX, 0])
-        odom_msg.twist.twist.linear.y = float(self.ekf.x[self.ekf.IVY, 0])
-        odom_msg.twist.twist.linear.z = float(self.ekf.x[self.ekf.IVZ, 0])
+        # ⬇️ FIXED: Pack Gyro Biases into the unused Angular Twist fields
+        odom_msg.twist.twist.angular.x = float(self.ekf.x[self.ekf.IBGX, 0])
+        odom_msg.twist.twist.angular.y = float(self.ekf.x[self.ekf.IBGY, 0])
+        odom_msg.twist.twist.angular.z = float(self.ekf.x[self.ekf.IBGZ, 0])
 
         self.odom_pub.publish(odom_msg)
 

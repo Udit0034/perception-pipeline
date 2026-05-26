@@ -34,7 +34,7 @@ env/
 ENV/
 
 # Model and data artifacts
-ONNX_Models/
+onnx_model/
 *.onnx
 *.onnxmodel
 *.engine
@@ -58,3 +58,7 @@ trt_engine_cache/
 *.synctex.gz
 *.pdf
 *.tex~
+
+# Shared and local resources
+shared_cache/
+requirements_clean.txt
